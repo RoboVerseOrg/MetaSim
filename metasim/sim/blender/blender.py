@@ -44,6 +44,8 @@ from metasim.types import (
 
 from .importers import MJCF_SUFFIXES, USD_SUFFIXES, import_usd_visuals
 from .lights import add_scenario_lights
+from .material_postprocess import classify_material
+from .usd_compat import resolve_usd_for_blender
 
 
 def import_mesh(path):
@@ -760,6 +762,42 @@ def _apply_optional_usd_stage_enhancements(usd_path: str | Path, imported: list)
     except UsdPythonBindingsUnavailable:
         return
     _apply_usd_material_specs(imported, specs)
+
+
+def _record_material_class_diagnostics(imported: list) -> None:
+    """Leave class tags on imported materials for future Blender-native polish."""
+    seen_objects: set[str] = set()
+    seen_collections: set[str] = set()
+    seen_materials: set[str] = set()
+
+    def visit_object(obj) -> None:
+        if obj.name in seen_objects:
+            return
+        seen_objects.add(obj.name)
+        if getattr(obj, "type", None) == "MESH":
+            for slot in getattr(obj, "material_slots", ()):
+                material = slot.material
+                if material is None or material.name in seen_materials:
+                    continue
+                seen_materials.add(material.name)
+                material_class = classify_material(
+                    name=material.name,
+                    mdl_source_asset=None,
+                    opacity=float(getattr(material, "diffuse_color", (1.0, 1.0, 1.0, 1.0))[3]),
+                    has_emissive=False,
+                )
+                if material_class is not None:
+                    material["metasim_material_class"] = material_class
+        collection = getattr(obj, "instance_collection", None)
+        if collection is not None and collection.name not in seen_collections:
+            seen_collections.add(collection.name)
+            for child in collection.objects:
+                visit_object(child)
+        for child in getattr(obj, "children", ()):
+            visit_object(child)
+
+    for obj in imported:
+        visit_object(obj)
 
 
 def _material_rgba_from_collada(collada_path: str | Path) -> dict[str, tuple[float, float, float, float]]:
@@ -1751,15 +1789,17 @@ class BlenderHandler(BaseSimHandler):
         scene_path = scene_cfg.file_name("blender")
         if not scene_path:
             raise ValueError(f"Scene {scene_cfg.name!r} has no Blender asset path")
+        resolved_scene_path = resolve_usd_for_blender(scene_path)
         result = import_usd_visuals(
-            scene_path,
+            resolved_scene_path,
             root_name=scene_cfg.name,
             default_position=getattr(scene_cfg, "default_position", None) or (0.0, 0.0, 0.0),
             default_orientation=_scene_orientation_wxyz(scene_cfg),
             scale=_scale_tuple(getattr(scene_cfg, "scale", (1.0, 1.0, 1.0))),
         )
         result.root.matrix_basis = _scene_usd_xform_matrix(scene_cfg)
-        _apply_optional_usd_stage_enhancements(scene_path, result.imported)
+        _apply_optional_usd_stage_enhancements(resolved_scene_path, result.imported)
+        _record_material_class_diagnostics(result.imported)
         self._scene_objs.append(result.root)
 
     def _add_lights(self) -> None:
@@ -1863,8 +1903,8 @@ class BlenderHandler(BaseSimHandler):
         out: delete the ``metasim_ground`` object after handler.launch().
 
         Also adds a ``metasim_table`` plane at z=0 — a smaller, warmer
-        tabletop where manipulation tasks place their objects (most
-        roboverse scenarios assume z=0 *is* the working surface, not the
+        tabletop where manipulation tasks place their objects (many
+        scenario configs assume z=0 *is* the working surface, not the
         floor). The floor stays underneath to fill out the periphery and
         give HDRI lighting something to bounce off.
         """
@@ -1984,15 +2024,17 @@ class BlenderHandler(BaseSimHandler):
             )
             return root
         if blender_path and suffix in USD_SUFFIXES:
+            resolved_blender_path = resolve_usd_for_blender(blender_path)
             result = import_usd_visuals(
-                blender_path,
+                resolved_blender_path,
                 root_name=obj_cfg.name,
                 default_position=obj_cfg.default_position,
                 default_orientation=obj_cfg.default_orientation,
                 scale=scale,
             )
             _repair_imported_materials(result.imported, _asset_material_rgba(obj_cfg))
-            _apply_optional_usd_stage_enhancements(blender_path, result.imported)
+            _apply_optional_usd_stage_enhancements(resolved_blender_path, result.imported)
+            _record_material_class_diagnostics(result.imported)
             return result.root
         if obj_cfg.mesh_path is not None:
             obj = import_mesh(obj_cfg.mesh_path)
@@ -2028,16 +2070,18 @@ class BlenderHandler(BaseSimHandler):
                 f"{type(obj_cfg).__name__} {obj_cfg.name!r} cannot be imported by Blender: "
                 f"path={usd_path!r}, supported suffixes are .usd/.usda/.usdc/.xml/.mjcf"
             )
+        resolved_usd_path = resolve_usd_for_blender(usd_path)
         asset_material_rgba = _asset_material_rgba(obj_cfg)
         result = import_usd_visuals(
-            usd_path,
+            resolved_usd_path,
             root_name=obj_cfg.name,
             default_position=obj_cfg.default_position,
             default_orientation=obj_cfg.default_orientation,
             scale=scale,
         )
         _repair_imported_materials(result.imported, asset_material_rgba)
-        _apply_optional_usd_stage_enhancements(usd_path, result.imported)
+        _apply_optional_usd_stage_enhancements(resolved_usd_path, result.imported)
+        _record_material_class_diagnostics(result.imported)
         self._objs[obj_cfg.name] = result.root
         self._register_body_objects(obj_cfg.name, result.imported)
 
