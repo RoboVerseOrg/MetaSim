@@ -44,7 +44,15 @@ from metasim.types import (
 
 from .importers import MJCF_SUFFIXES, USD_SUFFIXES, import_usd_visuals
 from .lights import add_scenario_lights
-from .material_postprocess import classify_material
+from .material_postprocess import (
+    classify_material,
+    classify_material_from_context,
+    fallback_spec_for_class,
+    material_has_image_texture,
+    material_render_alpha_for_class_fallback,
+    material_should_apply_class_fallback,
+    material_should_preserve_class_fallback_surface,
+)
 from .usd_compat import resolve_usd_for_blender
 
 
@@ -164,6 +172,7 @@ class UsdMaterialSpec:
     """Authored USD material inputs resolved from the source stage."""
 
     name: str
+    path: str | None = None
     base_color: tuple[float, float, float, float] | None = None
     base_color_texture: Path | None = None
     metallic: float | None = None
@@ -543,6 +552,31 @@ def _usd_input_value(values: dict[str, object], names: tuple[str, ...]):
     return None
 
 
+_USD_BASE_COLOR_TEXTURE_INPUT_NAMES = (
+    "BaseColor_Tex",
+    "BaseColor_Texture",
+    "base_color_texture",
+    "diffuse_texture",
+    "albedo_texture",
+    "diffuseColor_texture",
+)
+_USD_BASE_COLOR_TEXTURE_ENABLE_INPUT_NAMES = (
+    "IsBaseColorTex",
+    "use_diffuse_texture",
+    "use_base_color_texture",
+)
+
+
+def _usd_base_color_texture_path(values: dict[str, object], base_dir: Path) -> Path | None:
+    base_texture_value = _usd_input_value(values, _USD_BASE_COLOR_TEXTURE_INPUT_NAMES)
+    if base_texture_value is None:
+        return None
+    texture_enabled = _usd_value_as_scalar(_usd_input_value(values, _USD_BASE_COLOR_TEXTURE_ENABLE_INPUT_NAMES))
+    if texture_enabled is not None and texture_enabled <= 0.5:
+        return None
+    return _usd_asset_path(base_texture_value, base_dir)
+
+
 def _usd_shader_input_values(material_prim, UsdShade) -> dict[str, object]:
     values: dict[str, object] = {}
     for child in material_prim.GetChildren():
@@ -572,10 +606,12 @@ def _usd_material_specs_from_stage(usd_path: str | Path) -> dict[str, UsdMateria
         raise RuntimeError(f"Could not open USD stage for Blender material import: {path}")
 
     specs: dict[str, UsdMaterialSpec] = {}
+    aliases: dict[str, list[UsdMaterialSpec]] = {}
     for prim in stage.Traverse(Usd.PrimAllPrimsPredicate):
         if prim.GetTypeName() != "Material":
             continue
         material_name = prim.GetName()
+        material_path = str(prim.GetPath())
         values = _usd_shader_input_values(prim, UsdShade)
 
         base_color = _usd_value_as_color(
@@ -590,11 +626,7 @@ def _usd_material_specs_from_stage(usd_path: str | Path) -> dict[str, UsdMateria
                 ),
             )
         )
-        base_texture_value = _usd_input_value(values, ("BaseColor_Tex", "diffuse_texture", "albedo_texture"))
-        texture_enabled = _usd_value_as_scalar(_usd_input_value(values, ("IsBaseColorTex", "use_diffuse_texture")))
-        base_texture = _usd_asset_path(base_texture_value, path.parent) if (texture_enabled or 0.0) > 0.5 else None
-        if base_texture is None and "BaseColor_Tex" not in values:
-            base_texture = _usd_asset_path(base_texture_value, path.parent)
+        base_texture = _usd_base_color_texture_path(values, path.parent)
 
         roughness = _usd_value_as_scalar(
             _usd_input_value(values, ("reflection_roughness_constant", "roughness", "Roughness"))
@@ -612,14 +644,20 @@ def _usd_material_specs_from_stage(usd_path: str | Path) -> dict[str, UsdMateria
             continue
         spec = UsdMaterialSpec(
             name=material_name,
+            path=material_path,
             base_color=base_color,
             base_color_texture=base_texture,
             metallic=_clamp01(metallic) if metallic is not None else None,
             roughness=_clamp01(roughness) if roughness is not None else None,
             opacity=_clamp01(opacity) if opacity is not None else None,
         )
-        specs[material_name] = spec
-        specs[_normalized_material_name(material_name)] = spec
+        specs[material_path] = spec
+        for alias in dict.fromkeys((material_name, _normalized_material_name(material_name))):
+            aliases.setdefault(alias, []).append(spec)
+    for alias, alias_specs in aliases.items():
+        paths = {spec.path for spec in alias_specs}
+        if len(paths) == 1:
+            specs[alias] = alias_specs[0]
     return specs
 
 
@@ -661,8 +699,162 @@ def _usd_reference_xforms_by_name(usd_path: str | Path) -> dict[str, list[Matrix
     }
 
 
+def _usd_read_text_layer(path: Path) -> str | None:
+    if not path.is_file():
+        return None
+    try:
+        return path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def _usd_sublayer_paths_from_text(path: Path, text: str) -> list[Path]:
+    paths: list[Path] = []
+    for sublayers_match in re.finditer(r"subLayers\s*=\s*\[(?P<body>.*?)\]", text, re.DOTALL):
+        for asset_match in re.finditer(r"@(?P<asset>[^@]+)@", sublayers_match.group("body")):
+            asset = asset_match.group("asset")
+            if not asset:
+                continue
+            candidate = Path(asset)
+            if not candidate.is_absolute():
+                candidate = path.parent / candidate
+            paths.append(candidate.resolve())
+    return paths
+
+
+def _usd_text_layers_for_fallback(usd_path: str | Path) -> list[tuple[Path, str]]:
+    path = Path(usd_path)
+    if not path.is_absolute():
+        path = path.resolve()
+
+    layers: list[tuple[Path, str]] = []
+    stack = [path]
+    seen: set[Path] = set()
+    while stack:
+        current = stack.pop()
+        if current in seen:
+            continue
+        seen.add(current)
+        text = _usd_read_text_layer(current)
+        if text is None:
+            continue
+        layers.append((current, text))
+        stack.extend(reversed(_usd_sublayer_paths_from_text(current, text)))
+    return layers
+
+
+def _usd_find_matching_brace(text: str, open_brace_index: int) -> int | None:
+    depth = 0
+    for index in range(open_brace_index, len(text)):
+        char = text[index]
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return index
+    return None
+
+
+def _usd_float_tuple(raw: str, expected: int) -> tuple[float, ...] | None:
+    try:
+        values = tuple(float(value) for value in re.split(r"[\s,]+", raw.strip()) if value)
+    except ValueError:
+        return None
+    if len(values) != expected:
+        return None
+    return values
+
+
+def _usd_xform_vec3(body: str, op_name: str) -> tuple[float, float, float] | None:
+    match = re.search(
+        rf"(?:double3|float3|point3[fd])\s+xformOp:{re.escape(op_name)}\s*=\s*\((?P<value>[^)]*)\)",
+        body,
+    )
+    if match is None:
+        return None
+    values = _usd_float_tuple(match.group("value"), 3)
+    return values if values is not None else None
+
+
+def _usd_xform_quat(body: str, op_name: str) -> tuple[float, float, float, float] | None:
+    match = re.search(rf"quat[fd]\s+xformOp:{re.escape(op_name)}\s*=\s*\((?P<value>[^)]*)\)", body)
+    if match is None:
+        return None
+    values = _usd_float_tuple(match.group("value"), 4)
+    return values if values is not None else None
+
+
+def _usd_xform_order(body: str) -> list[str]:
+    match = re.search(r"xformOpOrder\s*=\s*\[(?P<value>[^\]]*)\]", body, re.DOTALL)
+    if match is None:
+        return []
+    return re.findall(r'"([^"]+)"', match.group("value"))
+
+
+def _usd_xform_matrix_from_body(body: str) -> Matrix | None:
+    translate = _usd_xform_vec3(body, "translate")
+    orient = _usd_xform_quat(body, "orient")
+    scale = _usd_xform_vec3(body, "scale")
+    ops = _usd_xform_order(body)
+    if not ops:
+        ops = [
+            op
+            for op, value in (
+                ("xformOp:translate", translate),
+                ("xformOp:orient", orient),
+                ("xformOp:scale", scale),
+            )
+            if value is not None
+        ]
+
+    matrix = Matrix.Identity(4)
+    used = False
+    for op in ops:
+        if op == "xformOp:translate" and translate is not None:
+            matrix = matrix @ Matrix.Translation(Vector(translate))
+            used = True
+        elif op == "xformOp:orient" and orient is not None:
+            matrix = matrix @ Quaternion(orient).to_matrix().to_4x4()
+            used = True
+        elif op == "xformOp:scale" and scale is not None:
+            matrix = matrix @ Matrix.Diagonal(tuple(scale) + (1.0,))
+            used = True
+    return matrix if used else None
+
+
+def _usd_reference_xforms_from_text(text: str) -> list[tuple[str, Matrix]]:
+    entries: list[tuple[str, Matrix]] = []
+    xform_header_re = re.compile(r'(?:def|over)\s+Xform\s+"(?P<name>[^"]+)"(?P<header>[^{}]*)\{', re.DOTALL)
+    for match in xform_header_re.finditer(text):
+        if "references" not in match.group("header"):
+            continue
+        open_brace = match.end() - 1
+        close_brace = _usd_find_matching_brace(text, open_brace)
+        if close_brace is None:
+            continue
+        matrix = _usd_xform_matrix_from_body(text[open_brace + 1 : close_brace])
+        if matrix is not None:
+            entries.append((match.group("name"), matrix))
+    return entries
+
+
+def _usd_reference_xforms_by_name_text_fallback(usd_path: str | Path) -> dict[str, list[Matrix]]:
+    entries: dict[str, list[tuple[str, Matrix]]] = {}
+    for layer_path, text in _usd_text_layers_for_fallback(usd_path):
+        for index, (name, matrix) in enumerate(_usd_reference_xforms_from_text(text)):
+            entries.setdefault(name, []).append((f"{layer_path}:{index}", matrix))
+    return {
+        name: [matrix for _path, matrix in sorted(values, key=lambda item: item[0])]
+        for name, values in entries.items()
+    }
+
+
 def _apply_usd_reference_xforms(usd_path: str | Path, imported: list) -> None:
-    reference_xforms = _usd_reference_xforms_by_name(usd_path)
+    try:
+        reference_xforms = _usd_reference_xforms_by_name(usd_path)
+    except UsdPythonBindingsUnavailable:
+        reference_xforms = _usd_reference_xforms_by_name_text_fallback(usd_path)
     if not reference_xforms:
         return
     imported_set = set(imported)
@@ -717,10 +909,64 @@ def _apply_usd_material_spec_to_material(material, spec: UsdMaterialSpec) -> Non
         material.show_transparent_back = False
 
 
+def _usd_spec_material_name(spec: UsdMaterialSpec) -> str:
+    if spec.path:
+        return spec.path.rsplit("/", 1)[-1]
+    return spec.name
+
+
+def _usd_context_components(text: str) -> list[str]:
+    components: list[str] = []
+    for raw in re.split(r"[/\s]+", text):
+        value = _normalized_material_name(raw).lower()
+        if not value or value in {"root", "meshes", "looks"}:
+            continue
+        if value.startswith("__prototype"):
+            continue
+        components.append(value)
+    return components
+
+
+def _usd_context_match_score(spec_path: str, object_context: str) -> int:
+    spec_parent = spec_path.rsplit("/", 1)[0]
+    spec_components = set(_usd_context_components(spec_parent))
+    if not spec_components:
+        return 0
+    return sum(1 for component in _usd_context_components(object_context) if component in spec_components)
+
+
+def _usd_material_spec_for_object_material(obj, material, specs: dict[str, UsdMaterialSpec]) -> UsdMaterialSpec | None:
+    for name in _material_name_candidates(material.name):
+        if name in specs:
+            return specs[name]
+
+    material_names = set(_material_name_candidates(material.name))
+    path_specs: list[UsdMaterialSpec] = []
+    seen_paths: set[str] = set()
+    for spec in specs.values():
+        if spec.path is None or not spec.path.startswith("/") or spec.path in seen_paths:
+            continue
+        seen_paths.add(spec.path)
+        if _normalized_material_name(_usd_spec_material_name(spec)) in material_names:
+            path_specs.append(spec)
+    if not path_specs:
+        return None
+
+    object_context = _object_context_name(obj)
+    scored = [(_usd_context_match_score(spec.path or "", object_context), spec) for spec in path_specs]
+    best_score = max(score for score, _spec in scored)
+    if best_score <= 0:
+        return None
+    best_specs = [spec for score, spec in scored if score == best_score]
+    if len(best_specs) != 1:
+        return None
+    return best_specs[0]
+
+
 def _apply_usd_material_specs(imported: list, specs: dict[str, UsdMaterialSpec]) -> None:
     seen_objects: set[str] = set()
     seen_collections: set[str] = set()
-    seen_materials: set[str] = set()
+    seen_material_contexts: set[tuple[int, str | None]] = set()
 
     def visit_object(obj) -> None:
         if obj.name in seen_objects:
@@ -729,13 +975,17 @@ def _apply_usd_material_specs(imported: list, specs: dict[str, UsdMaterialSpec])
         if getattr(obj, "type", None) == "MESH":
             for slot in obj.material_slots:
                 material = slot.material
-                if material is None or material.name in seen_materials:
+                if material is None:
                     continue
-                seen_materials.add(material.name)
-                spec = next(
-                    (specs[name] for name in _material_name_candidates(material.name) if name in specs),
-                    None,
-                )
+                spec = _usd_material_spec_for_object_material(obj, material, specs)
+                if spec is not None and any(key[0] == id(material) for key in seen_material_contexts):
+                    if getattr(material, "users", 1) > 1 and hasattr(material, "copy"):
+                        material = material.copy()
+                        slot.material = material
+                context_key = (id(material), spec.path if spec is not None else None)
+                if context_key in seen_material_contexts:
+                    continue
+                seen_material_contexts.add(context_key)
                 if spec is not None:
                     _apply_usd_material_spec_to_material(material, spec)
         collection = getattr(obj, "instance_collection", None)
@@ -788,6 +1038,111 @@ def _record_material_class_diagnostics(imported: list) -> None:
                 )
                 if material_class is not None:
                     material["metasim_material_class"] = material_class
+        collection = getattr(obj, "instance_collection", None)
+        if collection is not None and collection.name not in seen_collections:
+            seen_collections.add(collection.name)
+            for child in collection.objects:
+                visit_object(child)
+        for child in getattr(obj, "children", ()):
+            visit_object(child)
+
+    for obj in imported:
+        visit_object(obj)
+
+
+def _object_context_name(obj) -> str:
+    names: list[str] = []
+    current = obj
+    while current is not None:
+        name = getattr(current, "name", None)
+        if name:
+            names.append(str(name))
+        current = getattr(current, "parent", None)
+    names.reverse()
+    return "/".join(names)
+
+
+def _apply_material_class_fallbacks(imported: list) -> None:
+    """Apply generic class-level material fallbacks for default-gray USD imports."""
+    seen_objects: set[str] = set()
+    seen_collections: set[str] = set()
+    seen_material_contexts: set[tuple[int, str | None]] = set()
+
+    def apply_spec(material, spec, *, preserve_surface: bool = False, render_alpha: float | None = None) -> None:
+        if preserve_surface:
+            fallback_alpha = spec.base_color[3] if render_alpha is None else render_alpha
+            current = tuple(float(value) for value in getattr(material, "diffuse_color", spec.base_color)[:4])
+            material.diffuse_color = (current[0], current[1], current[2], fallback_alpha)
+            for node in getattr(getattr(material, "node_tree", None), "nodes", ()) or ():
+                if getattr(node, "bl_idname", "") != "ShaderNodeBsdfPrincipled":
+                    continue
+                _set_principled_input(node, "Alpha", fallback_alpha)
+                if fallback_alpha < 1.0 - _TRANSMISSIVE_ALPHA_EPSILON:
+                    _set_principled_input(node, "Transmission Weight", 0.35)
+            material.blend_method = "BLEND" if fallback_alpha < 1.0 - _TRANSMISSIVE_ALPHA_EPSILON else "OPAQUE"
+            if hasattr(material, "use_screen_refraction"):
+                material.use_screen_refraction = fallback_alpha < 1.0 - _TRANSMISSIVE_ALPHA_EPSILON
+            if hasattr(material, "show_transparent_back"):
+                material.show_transparent_back = False
+            return
+
+        _repair_material_surface_shader(material, spec.base_color)
+        for node in getattr(getattr(material, "node_tree", None), "nodes", ()) or ():
+            if getattr(node, "bl_idname", "") != "ShaderNodeBsdfPrincipled":
+                continue
+            _set_principled_input(node, "Roughness", spec.roughness)
+            _set_principled_input(node, "Metallic", spec.metallic)
+            _set_principled_input(node, "Alpha", spec.base_color[3])
+            if spec.base_color[3] < 1.0 - _TRANSMISSIVE_ALPHA_EPSILON:
+                _set_principled_input(node, "Transmission Weight", 0.35)
+                _set_principled_input(node, "IOR", 1.45)
+        material.diffuse_color = spec.base_color
+        material.blend_method = "BLEND" if spec.base_color[3] < 1.0 - _TRANSMISSIVE_ALPHA_EPSILON else "OPAQUE"
+        if hasattr(material, "use_screen_refraction"):
+            material.use_screen_refraction = spec.base_color[3] < 1.0 - _TRANSMISSIVE_ALPHA_EPSILON
+        if hasattr(material, "show_transparent_back"):
+            material.show_transparent_back = False
+
+    def visit_object(obj) -> None:
+        if obj.name in seen_objects:
+            return
+        seen_objects.add(obj.name)
+        if getattr(obj, "type", None) == "MESH":
+            context_name = _object_context_name(obj)
+            for slot in getattr(obj, "material_slots", ()):
+                material = slot.material
+                if material is None:
+                    continue
+                opacity = float(getattr(material, "diffuse_color", (1.0, 1.0, 1.0, 1.0))[3])
+                material_class = classify_material_from_context(
+                    object_name=context_name,
+                    material_name=material.name,
+                    mdl_source_asset=None,
+                    opacity=opacity,
+                    has_emissive=False,
+                )
+                if material_class is not None and any(key[0] == id(material) for key in seen_material_contexts):
+                    if getattr(material, "users", 1) > 1 and hasattr(material, "copy"):
+                        material = material.copy()
+                        slot.material = material
+                context_key = (id(material), material_class)
+                if context_key in seen_material_contexts:
+                    continue
+                seen_material_contexts.add(context_key)
+                if material_class is not None:
+                    material["metasim_material_class"] = material_class
+                spec = fallback_spec_for_class(material_class)
+                if spec is not None and material_should_apply_class_fallback(material, material_class):
+                    apply_spec(
+                        material,
+                        spec,
+                        preserve_surface=material_should_preserve_class_fallback_surface(material, material_class),
+                        render_alpha=material_render_alpha_for_class_fallback(
+                            material,
+                            material_class,
+                            spec.base_color[3],
+                        ),
+                    )
         collection = getattr(obj, "instance_collection", None)
         if collection is not None and collection.name not in seen_collections:
             seen_collections.add(collection.name)
@@ -908,7 +1263,158 @@ def _asset_material_rgba(obj_cfg: ArticulationObjCfg | RigidObjCfg) -> dict[str,
         elif resolved.suffix.lower() in {".xml", ".mjcf"}:
             material_colors.update(_material_rgba_from_mjcf(resolved))
 
+    for sidecar_path in _usd_asset_material_sidecar_paths(getattr(obj_cfg, "usd_path", None)):
+        if sidecar_path.suffix.lower() == ".urdf":
+            material_colors.update(_material_rgba_from_urdf(sidecar_path))
+        elif sidecar_path.suffix.lower() in {".xml", ".mjcf"}:
+            material_colors.update(_material_rgba_from_mjcf(sidecar_path))
+
     return material_colors
+
+
+def _material_textures_from_mtl(mtl_path: str | Path) -> dict[str, Path]:
+    path = Path(mtl_path)
+    material_textures: dict[str, Path] = {}
+    current_name: str | None = None
+    try:
+        lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except OSError:
+        return material_textures
+
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        keyword = parts[0].lower()
+        if keyword == "newmtl" and len(parts) >= 2:
+            current_name = _normalized_material_name(parts[1])
+            continue
+        if keyword != "map_kd" or current_name is None or len(parts) < 2:
+            continue
+        texture_token = parts[-1]
+        texture_path = _resolve_asset_path(texture_token, path.parent)
+        if texture_path is not None:
+            material_textures[current_name] = texture_path
+    return material_textures
+
+
+def _material_textures_from_obj(obj_path: str | Path) -> dict[str, Path]:
+    path = Path(obj_path)
+    material_textures: dict[str, Path] = {}
+    try:
+        lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except OSError:
+        return material_textures
+
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split(maxsplit=1)
+        if len(parts) != 2 or parts[0].lower() != "mtllib":
+            continue
+        for mtl_token in parts[1].split():
+            mtl_path = _resolve_asset_path(mtl_token, path.parent)
+            if mtl_path is not None:
+                material_textures.update(_material_textures_from_mtl(mtl_path))
+    return material_textures
+
+
+def _material_textures_from_urdf(urdf_path: str | Path) -> dict[str, Path]:
+    path = Path(urdf_path)
+    root = ET.parse(path).getroot()
+    material_textures: dict[str, Path] = {}
+
+    for mesh in root.findall(".//{*}visual/{*}geometry/{*}mesh"):
+        filename = mesh.get("filename")
+        if not filename:
+            continue
+        mesh_path = _resolve_asset_path(filename, path.parent)
+        if mesh_path is not None and mesh_path.suffix.lower() == ".obj":
+            material_textures.update(_material_textures_from_obj(mesh_path))
+    return material_textures
+
+
+def _material_textures_from_mjcf(mjcf_path: str | Path) -> dict[str, Path]:
+    path = Path(mjcf_path)
+    root = ET.parse(path).getroot()
+    return {
+        _normalized_material_name(name): texture_path
+        for name, texture_path in _mjcf_material_textures(root, path.parent).items()
+    }
+
+
+def _asset_material_textures(obj_cfg: ArticulationObjCfg | RigidObjCfg) -> dict[str, Path]:
+    material_textures: dict[str, Path] = {}
+    for asset_path, parser in (
+        (getattr(obj_cfg, "mjcf_path", None), _material_textures_from_mjcf),
+        (getattr(obj_cfg, "urdf_path", None), _material_textures_from_urdf),
+    ):
+        if not asset_path:
+            continue
+        resolved = _resolve_asset_path(asset_path)
+        if resolved is not None:
+            material_textures.update(parser(resolved))
+
+    for asset_path in getattr(obj_cfg, "extra_resources", ()):
+        resolved = _resolve_asset_path(asset_path)
+        if resolved is None:
+            continue
+        suffix = resolved.suffix.lower()
+        if suffix == ".obj":
+            material_textures.update(_material_textures_from_obj(resolved))
+        elif suffix == ".urdf":
+            material_textures.update(_material_textures_from_urdf(resolved))
+        elif suffix in {".xml", ".mjcf"}:
+            material_textures.update(_material_textures_from_mjcf(resolved))
+
+    for sidecar_path in _usd_asset_material_sidecar_paths(getattr(obj_cfg, "usd_path", None)):
+        suffix = sidecar_path.suffix.lower()
+        if suffix == ".urdf":
+            material_textures.update(_material_textures_from_urdf(sidecar_path))
+        elif suffix in {".xml", ".mjcf"}:
+            material_textures.update(_material_textures_from_mjcf(sidecar_path))
+
+    return material_textures
+
+
+def _usd_asset_material_sidecar_paths(asset_path: str | Path | None) -> list[Path]:
+    if not asset_path:
+        return []
+    resolved = _resolve_asset_path(asset_path)
+    if resolved is None:
+        return []
+
+    roots: list[Path] = []
+    for candidate in (resolved.parent, resolved.parent.parent):
+        if candidate not in roots:
+            roots.append(candidate)
+
+    sidecars: list[Path] = []
+    for root in roots:
+        for suffix in (".urdf", ".xml", ".mjcf"):
+            same_stem = root / f"{resolved.stem}{suffix}"
+            if same_stem.is_file():
+                sidecars.append(same_stem)
+        for suffix in (".urdf", ".xml", ".mjcf"):
+            sidecars.extend(sorted(root.glob(f"*{suffix}")))
+        for subdir, suffixes in (("urdf", (".urdf",)), ("mjcf", (".xml", ".mjcf"))):
+            directory = root / subdir
+            if not directory.is_dir():
+                continue
+            for suffix in suffixes:
+                sidecars.extend(sorted(directory.glob(f"*{suffix}")))
+
+    seen: set[Path] = set()
+    unique_sidecars: list[Path] = []
+    for sidecar in sidecars:
+        resolved_sidecar = sidecar.resolve()
+        if resolved_sidecar in seen:
+            continue
+        seen.add(resolved_sidecar)
+        unique_sidecars.append(resolved_sidecar)
+    return unique_sidecars
 
 
 def _material_has_surface_shader(material) -> bool:
@@ -1650,6 +2156,56 @@ def _repair_imported_materials(
         visit_object(obj)
 
 
+def _apply_imported_material_textures(imported: list, asset_material_textures: dict[str, Path] | None = None) -> None:
+    if not asset_material_textures:
+        return
+
+    seen_objects: set[str] = set()
+    seen_collections: set[str] = set()
+    seen_materials: set[str] = set()
+
+    def texture_for_material(material_name: str) -> Path | None:
+        return next(
+            (
+                asset_material_textures[name]
+                for name in _material_name_candidates(material_name)
+                if name in asset_material_textures
+            ),
+            None,
+        )
+
+    def visit_object(obj) -> None:
+        if obj.name in seen_objects:
+            return
+        seen_objects.add(obj.name)
+        if getattr(obj, "type", None) == "MESH":
+            if not obj.material_slots and len(asset_material_textures) == 1:
+                material_name, texture_path = next(iter(asset_material_textures.items()))
+                material = _new_material_from_rgba(material_name, (1.0, 1.0, 1.0, 1.0))
+                _apply_texture_to_material(material, texture_path)
+                obj.data.materials.append(material)
+            for slot in obj.material_slots:
+                material = slot.material
+                if material is None or material.name in seen_materials:
+                    continue
+                seen_materials.add(material.name)
+                if material_has_image_texture(material):
+                    continue
+                texture_path = texture_for_material(material.name)
+                if texture_path is not None:
+                    _apply_texture_to_material(material, texture_path)
+        collection = getattr(obj, "instance_collection", None)
+        if collection is not None and collection.name not in seen_collections:
+            seen_collections.add(collection.name)
+            for child in collection.objects:
+                visit_object(child)
+        for child in getattr(obj, "children", ()):
+            visit_object(child)
+
+    for obj in imported:
+        visit_object(obj)
+
+
 def _blender_body_name_alias(body_name: str) -> str:
     """Map known MetaSim robot body names to Blender/USD object names."""
     for prefix in ("left_", "right_"):
@@ -1793,13 +2349,18 @@ class BlenderHandler(BaseSimHandler):
         result = import_usd_visuals(
             resolved_scene_path,
             root_name=scene_cfg.name,
-            default_position=getattr(scene_cfg, "default_position", None) or (0.0, 0.0, 0.0),
-            default_orientation=_scene_orientation_wxyz(scene_cfg),
-            scale=_scale_tuple(getattr(scene_cfg, "scale", (1.0, 1.0, 1.0))),
+            default_position=(0.0, 0.0, 0.0),
+            default_orientation=(1.0, 0.0, 0.0, 0.0),
+            scale=(1.0, 1.0, 1.0),
         )
-        result.root.matrix_basis = _scene_usd_xform_matrix(scene_cfg)
+        scene_xform = _scene_usd_xform_matrix(scene_cfg)
+        if getattr(result.root, "parent", None) is None:
+            result.root.matrix_basis = scene_xform
+        else:
+            result.root.matrix_world = scene_xform
         _apply_optional_usd_stage_enhancements(resolved_scene_path, result.imported)
         _record_material_class_diagnostics(result.imported)
+        _apply_material_class_fallbacks(result.imported)
         self._scene_objs.append(result.root)
 
     def _add_lights(self) -> None:
@@ -2025,6 +2586,8 @@ class BlenderHandler(BaseSimHandler):
             return root
         if blender_path and suffix in USD_SUFFIXES:
             resolved_blender_path = resolve_usd_for_blender(blender_path)
+            asset_material_rgba = _asset_material_rgba(obj_cfg)
+            asset_material_textures = _asset_material_textures(obj_cfg)
             result = import_usd_visuals(
                 resolved_blender_path,
                 root_name=obj_cfg.name,
@@ -2032,9 +2595,11 @@ class BlenderHandler(BaseSimHandler):
                 default_orientation=obj_cfg.default_orientation,
                 scale=scale,
             )
-            _repair_imported_materials(result.imported, _asset_material_rgba(obj_cfg))
+            _repair_imported_materials(result.imported, asset_material_rgba)
             _apply_optional_usd_stage_enhancements(resolved_blender_path, result.imported)
+            _apply_imported_material_textures(result.imported, asset_material_textures)
             _record_material_class_diagnostics(result.imported)
+            _apply_material_class_fallbacks(result.imported)
             return result.root
         if obj_cfg.mesh_path is not None:
             obj = import_mesh(obj_cfg.mesh_path)
@@ -2072,6 +2637,7 @@ class BlenderHandler(BaseSimHandler):
             )
         resolved_usd_path = resolve_usd_for_blender(usd_path)
         asset_material_rgba = _asset_material_rgba(obj_cfg)
+        asset_material_textures = _asset_material_textures(obj_cfg)
         result = import_usd_visuals(
             resolved_usd_path,
             root_name=obj_cfg.name,
@@ -2081,7 +2647,9 @@ class BlenderHandler(BaseSimHandler):
         )
         _repair_imported_materials(result.imported, asset_material_rgba)
         _apply_optional_usd_stage_enhancements(resolved_usd_path, result.imported)
+        _apply_imported_material_textures(result.imported, asset_material_textures)
         _record_material_class_diagnostics(result.imported)
+        _apply_material_class_fallbacks(result.imported)
         self._objs[obj_cfg.name] = result.root
         self._register_body_objects(obj_cfg.name, result.imported)
 
