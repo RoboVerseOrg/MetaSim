@@ -135,7 +135,9 @@ def check_and_download_single(filepath: str):
     else:
         ## In this case, we didn't find the file in the local directory, the circumstance is complicated.
         # Use POSIX-style paths for the HF dataset API (Windows uses backslashes by default)
-        relpath = os.path.relpath(filepath, LOCAL_DIR)
+        # Compare *real* paths: LOCAL_DIR is commonly a symlink to a shared asset checkout (CI caches,
+        # git worktrees), and a symlink-vs-target mismatch must not be mistaken for traversal.
+        relpath = os.path.relpath(os.path.realpath(filepath), os.path.realpath(LOCAL_DIR))
         is_optional_file = filepath.endswith((".mtl", ".png", ".jpg", ".jpeg", ".bmp", ".tga"))
         # A malformed asset descriptor with ``..`` segments would resolve
         # outside LOCAL_DIR — refuse it rather than send the escaped path
