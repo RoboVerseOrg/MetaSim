@@ -22,7 +22,9 @@ handler, so these helpers are unit-testable without the engine.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
+import shutil
 import tempfile
 import xml.etree.ElementTree as _ET  # element construction only; parsing goes through defusedxml
 from dataclasses import dataclass, field
@@ -86,11 +88,18 @@ def resolve_mesh_path(filename: str, urdf_dir: str) -> str:
     """Resolve a URDF mesh ``filename`` (``package://``, relative or absolute) to an absolute path."""
     if filename.startswith("package://"):
         rel = filename[len("package://") :]
-        # ROS-style: package://<pkg>/<path>. Try the path as-is relative to the URDF dir first
-        # (RoboVerse assets are laid out that way), then drop the leading package segment.
-        for cand in (os.path.join(urdf_dir, rel), os.path.join(urdf_dir, *rel.split("/")[1:])):
-            if os.path.exists(cand):
-                return os.path.abspath(cand)
+        # ROS-style: package://<pkg>/<path>. Try the path as-is and without the package segment,
+        # relative to the URDF dir and then to each of its parents (URDF in pkg/robots/, meshes in
+        # pkg/meshes/). RoboVerse assets resolve at the first level.
+        base = urdf_dir
+        for _ in range(6):
+            for cand in (os.path.join(base, rel), os.path.join(base, *rel.split("/")[1:])):
+                if os.path.exists(cand):
+                    return os.path.abspath(cand)
+            parent = os.path.dirname(base)
+            if parent == base:
+                break
+            base = parent
         return os.path.abspath(os.path.join(urdf_dir, rel))
     if filename.startswith("file://"):
         filename = filename[len("file://") :]
@@ -160,6 +169,17 @@ class VisualGeom:
 
 
 @dataclass
+class LinkInertial:
+    """URDF ``<inertial>`` of one link, expressed in the link frame."""
+
+    mass: float
+    com: np.ndarray
+    """Centre of mass position (3,) in the link frame."""
+    inertia: np.ndarray
+    """3x3 inertia tensor about the centre of mass, in the link frame (URDF ixx..iyz rotated by the inertial origin rpy)."""
+
+
+@dataclass
 class BakedUrdf:
     """Result of :func:`bake_urdf`."""
 
@@ -170,10 +190,72 @@ class BakedUrdf:
     """Joint names in document order (fixed joints included)."""
     joint_types: dict[str, str] = field(default_factory=dict)
     link_masses: dict[str, float] = field(default_factory=dict)
+    link_inertials: dict[str, LinkInertial] = field(default_factory=dict)
+    """Parsed ``<inertial>`` per link (mass, centre of mass, inertia tensor in the link frame)."""
     visuals: dict[str, list[VisualGeom]] = field(default_factory=dict)
     """Visual geometry per link, for the offscreen renderer."""
     collisions: dict[str, list[tuple[str, np.ndarray]]] = field(default_factory=dict)
     """Per link: (absolute hull mesh path, link_from_geom 4x4) for every baked collision."""
+
+
+def _parse_inertial(inertial: ET.Element, scale: np.ndarray) -> LinkInertial | None:
+    """Parse a URDF ``<inertial>`` block; returns None when the mass is missing or non-positive."""
+    mass_el = inertial.find("mass")
+    if mass_el is None or mass_el.get("value") is None:
+        return None
+    mass = float(mass_el.get("value"))
+    if mass <= 0:
+        return None
+    origin = origin_to_matrix(inertial.find("origin"))
+    com = origin[:3, 3] * scale
+    inertia_el = inertial.find("inertia")
+    tensor = np.zeros((3, 3))
+    if inertia_el is not None:
+        g = lambda k: float(inertia_el.get(k, 0.0))  # noqa: E731
+        tensor = np.array([
+            [g("ixx"), g("ixy"), g("ixz")],
+            [g("ixy"), g("iyy"), g("iyz")],
+            [g("ixz"), g("iyz"), g("izz")],
+        ])
+        rot = origin[:3, :3]
+        tensor = rot @ tensor @ rot.T  # inertial-frame tensor -> link frame (about the CoM)
+        s2 = float(np.prod(scale) ** (2.0 / 3.0)) if not np.allclose(scale, 1.0) else 1.0
+        tensor = tensor * s2
+    return LinkInertial(mass=mass, com=com, inertia=tensor)
+
+
+def mjcf_inertials(mjcf_path: str) -> dict[str, LinkInertial]:
+    """Explicit ``<inertial>`` blocks of an MJCF, keyed by body name.
+
+    Used as a fallback when a URDF ships no ``<inertial>`` data (e.g. the RoboVerse Franka) but the
+    sibling MJCF the MuJoCo backend loads does, so both backends simulate the same mass distribution.
+    Only bodies with an explicit ``<inertial>`` are returned; MuJoCo's geom-derived inertias are not
+    reproduced. ``diaginertia``/``fullinertia`` are converted to a 3x3 tensor in the body frame
+    (``quat`` on the inertial element is wxyz, as in MJCF).
+    """
+    root = ET.parse(mjcf_path).getroot()
+    out: dict[str, LinkInertial] = {}
+    for body in root.iter("body"):
+        name, inertial = body.get("name"), body.find("inertial")
+        if not name or inertial is None or inertial.get("mass") is None:
+            continue
+        mass = float(inertial.get("mass"))
+        if mass <= 0:
+            continue
+        com = _as_vec(inertial.get("pos"), (0.0, 0.0, 0.0))
+        w, x, y, z = _as_vec(inertial.get("quat"), (1.0, 0.0, 0.0, 0.0))
+        rot = np.array([
+            [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+            [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+        ])
+        if inertial.get("fullinertia"):
+            xx, yy, zz, xy, xz, yz = _as_vec(inertial.get("fullinertia"), (0,) * 6)
+            tensor = np.array([[xx, xy, xz], [xy, yy, yz], [xz, yz, zz]])
+        else:
+            tensor = np.diag(_as_vec(inertial.get("diaginertia"), (0.0, 0.0, 0.0)))
+        out[name] = LinkInertial(mass=mass, com=com, inertia=rot @ tensor @ rot.T)
+    return out
 
 
 def _material_colors(root: ET.Element) -> dict[str, tuple[float, float, float, float]]:
@@ -206,17 +288,30 @@ def bake_urdf(
         raise FileNotFoundError(f"URDF not found: {urdf_path}")
     cache_dir = cache_dir or default_cache_dir()
     scale_arr = np.asarray(scale, dtype=np.float64)
-    key = _content_key(urdf_path, os.path.getmtime(urdf_path), tuple(np.round(scale_arr, 6)))
-    out_dir = os.path.join(cache_dir, f"{os.path.splitext(os.path.basename(urdf_path))[0]}_{key}")
-    os.makedirs(out_dir, exist_ok=True)
-    out_path = os.path.join(out_dir, os.path.basename(urdf_path))
-
     urdf_dir = os.path.dirname(urdf_path)
     tree = ET.parse(urdf_path)
     root = tree.getroot()
+    # The cache key covers the URDF *and* every collision mesh it references, so regenerating a mesh
+    # without touching the URDF (the usual asset-pipeline edit) invalidates the baked hulls.
+    mesh_stamps = []
+    for mesh_el in root.iter("collision"):
+        for m in mesh_el.iter("mesh"):
+            mp = resolve_mesh_path(m.get("filename", ""), urdf_dir)
+            if os.path.isfile(mp):
+                mesh_stamps.append((mp, os.path.getmtime(mp), os.path.getsize(mp)))
+    key = _content_key(urdf_path, os.path.getmtime(urdf_path), tuple(np.round(scale_arr, 6)), *mesh_stamps)
+    final_dir = os.path.join(cache_dir, f"{os.path.splitext(os.path.basename(urdf_path))[0]}_{key}")
+    final_path = os.path.join(final_dir, os.path.basename(urdf_path))
+    rebuild = not os.path.isfile(final_path)
+    # Build into a private directory and rename it into place so concurrent processes (parallel-env
+    # workers on a cold cache) never observe a half-written bake.
+    out_dir = f"{final_dir}.tmp-{os.getpid()}" if rebuild else final_dir
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, os.path.basename(urdf_path))
+
     colors = _material_colors(root)
-    baked = BakedUrdf(path=out_path)
-    rebuild = not os.path.isfile(out_path)
+    baked = BakedUrdf(path=final_path)
+    hulled: list[str] = []
 
     for link in root.iter("link"):
         name = link.get("name", "")
@@ -224,6 +319,9 @@ def bake_urdf(
         inertial = link.find("inertial/mass")
         if inertial is not None and inertial.get("value") is not None:
             baked.link_masses[name] = float(inertial.get("value"))
+            parsed = _parse_inertial(link.find("inertial"), scale_arr)
+            if parsed is not None:
+                baked.link_inertials[name] = parsed
 
         # --- collisions -> hull meshes -------------------------------------------------------
         baked.collisions[name] = []
@@ -231,13 +329,16 @@ def bake_urdf(
             geometry = col.find("geometry")
             if geometry is None:
                 continue
-            hull_path = os.path.join(out_dir, f"{name}_collision{idx}_hull.obj")
-            if rebuild or not os.path.isfile(hull_path):
+            hull_name = f"{name}_collision{idx}_hull.obj"
+            hull_path = os.path.join(final_dir, hull_name)
+            if rebuild:
                 mesh = geometry_to_trimesh(geometry, urdf_dir).copy()
                 if not np.allclose(scale_arr, 1.0):
                     mesh.apply_scale(scale_arr)
                 hull = watertight_hull(mesh)
-                hull.export(hull_path)
+                if hull is not mesh:
+                    hulled.append(name)
+                hull.export(os.path.join(out_dir, hull_name))
             for child in list(geometry):
                 geometry.remove(child)
             _ET.SubElement(geometry, "mesh", {"filename": hull_path})
@@ -284,8 +385,27 @@ def bake_urdf(
         if origin is not None and not np.allclose(scale_arr, 1.0):
             origin.set("xyz", " ".join(f"{v:.9g}" for v in _as_vec(origin.get("xyz"), (0, 0, 0)) * scale_arr))
 
+    info_path = os.path.join(final_dir, "bake_info.json")
     if rebuild:
         tree.write(out_path)
+        with open(os.path.join(out_dir, "bake_info.json"), "w", encoding="utf-8") as f:
+            json.dump({"source": urdf_path, "hulled_links": sorted(set(hulled))}, f)
+        try:
+            os.rename(out_dir, final_dir)
+        except OSError:  # another process finished the same bake first; use theirs
+            shutil.rmtree(out_dir, ignore_errors=True)
+    else:
+        try:
+            with open(info_path, encoding="utf-8") as f:
+                hulled = json.load(f).get("hulled_links", [])
+        except (OSError, ValueError):
+            hulled = []
+    if hulled:
+        log.warning(
+            f"[superdex] {os.path.basename(urdf_path)}: collision geometry of links {sorted(set(hulled))} is not "
+            "watertight and was replaced by its convex hull (SuperDex bakes SDF colliders); contact geometry "
+            "therefore differs from backends that use the original meshes"
+        )
     return baked
 
 

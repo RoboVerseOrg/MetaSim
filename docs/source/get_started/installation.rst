@@ -169,7 +169,7 @@ Install SuperDex (Meta Mochi engine)
 
 `SuperDex <https://github.com/facebookresearch/project_superdex>`__ is Meta's contact-first, fully
 implicit rigid/articulated/soft-body engine. Its ``superdex-physics`` / ``superdex-robotics`` wheels
-are published for **Python 3.12 only**, so use a dedicated 3.12 environment:
+are published for **Python >= 3.12** (cp312 at the time of writing), so use a dedicated 3.12 environment:
 
 .. code-block:: bash
 
@@ -180,13 +180,27 @@ Then select it like any other backend (``ScenarioCfg(simulator="superdex")`` or 
 What to expect from the backend (see ``metasim/sim/superdex/superdex.py`` for the full list):
 
 - **Assets**: robots and articulated objects load from ``urdf_path``; primitives and mesh objects are
-  supported. Collision geometry is replaced by watertight convex hulls in a cache directory
-  (``$METASIM_SUPERDEX_CACHE``, default ``<tmp>/metasim_superdex_cache``) because SuperDex bakes SDF
-  colliders and ignores URDF primitives. MJCF/USD are not read.
-- **Control**: ``RobotCfg.actuators`` stiffness/damping/effort limits drive SuperDex's implicit pose
-  controller; position, velocity and effort targets are supported.
+  supported. Collision geometry that is not watertight is replaced by its convex hull in a cache
+  directory (``$METASIM_SUPERDEX_CACHE``, default ``<tmp>/metasim_superdex_cache``) because SuperDex
+  bakes SDF colliders and ignores URDF primitives; a warning names the affected links, since contact
+  geometry then differs from backends that use the original meshes. MJCF/USD are not read, but when a
+  URDF ships no ``<inertial>`` data and the cfg also has an ``mjcf_path``, the explicit MJCF inertials
+  are used so the mass distribution matches the MuJoCo backend.
+- **Physics alignment**: Coulomb friction defaults to 1.0 (MuJoCo's geom default; ``static_friction``
+  overrides it), URDF joint ranges are enforced with stiff limit penalties, and
+  ``enabled_gravity=False`` compensates gravity on every link as the MuJoCo backend does.
+- **Control**: ``RobotCfg.actuators`` stiffness/damping drive SuperDex's implicit pose controller;
+  the effort clamp is ``effort_limit_sim`` if set, else the URDF ``<limit effort>``. Position targets
+  are exact; velocity targets are best effort (they feed the controller's damping term while the
+  position target keeps acting, as on MuJoCo); effort targets are applied as external DoF forces.
+- **Free bases**: ``fix_base_link=False`` articulations need ``<inertial>`` mass on every link
+  (launch fails fast otherwise); ``root_state`` reports the world pose of the root link.
+- **Contact forces** (``metasim.queries.ContactForces``): SuperDex 1.0 only exposes contact queries
+  on mesh rigid actors, so robot link forces are assembled from the dynamic objects the robot touches;
+  ground-plane, static-object and self contacts are not observable (a warning says so).
 - **Cameras**: RGB + depth are rendered offscreen with ``pyrender`` (EGL) from the physics link
-  transforms. Instance segmentation and mounted cameras are not implemented (launch fails loudly).
+  transforms; world-fixed and link-mounted cameras are supported. Instance segmentation is not
+  implemented (launch fails loudly).
 - **Parallelism**: one scene per handler on the CPU; ``num_envs > 1`` uses worker processes, as for
   MuJoCo/PyBullet. There is no GUI viewer; ``headless=False`` only logs a warning.
 

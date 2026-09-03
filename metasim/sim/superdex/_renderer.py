@@ -15,6 +15,7 @@ from __future__ import annotations
 import os
 
 import numpy as np
+from loguru import logger as log
 
 # pyrender's EGL platform needs to be selected before it (PyOpenGL) is first imported. Respect a
 # user choice; default to EGL, which is what every other headless renderer in MetaSim assumes.
@@ -111,8 +112,12 @@ class OffscreenRenderer:
         for node, body_from_geom in self._nodes.get((obj_name, body_name), ()):
             self._scene.set_pose(node, world_from_body @ body_from_geom)
 
-    def render(self, camera_cfg) -> tuple[np.ndarray, np.ndarray]:
-        """Render one ``PinholeCameraCfg``: returns (rgb uint8 HxWx3, depth float32 HxW in metres, 0 = no hit)."""
+    def render(self, camera_cfg, pose: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
+        """Render one ``PinholeCameraCfg``: returns (rgb uint8 HxWx3, depth float32 HxW in metres, 0 = no hit).
+
+        ``pose`` overrides the camera-to-world transform (mounted cameras); by default it is derived from
+        ``pos``/``look_at``.
+        """
         width, height = int(camera_cfg.width), int(camera_cfg.height)
         near, far = camera_cfg.clipping_range
         cam = pyrender.PerspectiveCamera(
@@ -121,8 +126,9 @@ class OffscreenRenderer:
             znear=float(near),
             zfar=float(far),
         )
-        pose = look_at_pose(camera_cfg.pos, camera_cfg.look_at)
-        node = self._scene.add(cam, pose=pose)
+        if pose is None:
+            pose = look_at_pose(camera_cfg.pos, camera_cfg.look_at)
+        node = self._scene.add(cam, pose=np.asarray(pose, dtype=np.float64))
         try:
             renderer = self._renderers.get((width, height))
             if renderer is None:
@@ -137,6 +143,6 @@ class OffscreenRenderer:
         for renderer in self._renderers.values():
             try:
                 renderer.delete()
-            except Exception:
-                pass
+            except Exception as exc:  # best effort GL teardown
+                log.debug(f"[superdex] renderer teardown: {exc}")
         self._renderers.clear()

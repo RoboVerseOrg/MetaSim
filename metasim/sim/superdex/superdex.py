@@ -66,8 +66,25 @@ SuperDex's implicit integrator is stable at 10-25 ms; 5 ms keeps env-step timing
 (``dt * decimation``) close to the other CPU backends while leaving a wide stability margin.
 """
 
+DEFAULT_FRICTION = 1.0
+"""Coulomb friction used when a cfg sets none: MuJoCo's geom default, so contacts match that backend
+(SuperDex's own default is 0.5)."""
+
+JOINT_LIMIT_STIFFNESS = 5.0e6
+JOINT_LIMIT_DAMPING = 5.0e3
+"""URDF limits are hard constraints in MuJoCo/PhysX; SuperDex models them as penalties (its URDF loader
+sets stiffness 100, which the pose controller pushes through). These gains make the range effectively
+hard at the 5 ms default step (measured on the Franka fingers: 100 -> 29 mm overshoot past the range,
+5e4 -> 1.2 mm, 5e6 -> 0.0 mm)."""
+
 _ONE_DOF_JOINTS = {"REVOLUTE", "PRISMATIC", "CYCLE"}
 _PRIMITIVE_CFGS = (PrimitiveCubeCfg, PrimitiveSphereCfg, PrimitiveCylinderCfg)
+
+
+def _friction(cfg) -> float:
+    """Coulomb friction for a cfg: ``static_friction`` if set, else the MuJoCo-compatible default."""
+    value = getattr(cfg, "static_friction", None)
+    return float(value) if value is not None else DEFAULT_FRICTION
 
 
 def _joint_type_name(joint_type) -> str:
@@ -132,8 +149,10 @@ class _Articulation:
     num_dofs: int
     controlled: bool = False
     target_pose: np.ndarray | None = None
+    target_vel: np.ndarray | None = None
     effort: np.ndarray | None = None
     link_actors: list = field(default_factory=list)
+    contact_queries: list = field(default_factory=list)
 
 
 @dataclass
@@ -159,6 +178,7 @@ class SuperdexHandler(BaseSimHandler):
         self._num_threads = int(getattr(scenario.sim_params, "num_threads", 0) or 0)
         self._cache_dir = _assets.default_cache_dir()
         self._sim_time = 0.0
+        self._contact_queries_fresh = False
 
     # ------------------------------------------------------------------ lifecycle
     def launch(self) -> None:
@@ -224,7 +244,12 @@ class SuperdexHandler(BaseSimHandler):
                     f"[superdex] camera '{cam.name}' requests {unsupported}; the SuperDex backend renders rgb/depth only"
                 )
             if cam.mount_to is not None:
-                raise NotImplementedError(f"[superdex] camera '{cam.name}': mounted cameras are not implemented yet")
+                if cam.mount_to not in {o.name for o in self.objects} | {r.name for r in self.robots}:
+                    raise ValueError(f"[superdex] camera '{cam.name}' is mounted to unknown object '{cam.mount_to}'")
+                if cam.mount_link is None or cam.mount_pos is None or cam.mount_quat is None:
+                    raise ValueError(
+                        f"[superdex] camera '{cam.name}': mount_to needs mount_link, mount_pos and mount_quat"
+                    )
 
     def _add_object(self, cfg: BaseObjCfg) -> None:
         if isinstance(cfg, ArticulationObjCfg):
@@ -248,12 +273,15 @@ class SuperdexHandler(BaseSimHandler):
                 kwargs["mass"] = float(mass)
             elif density is not None:
                 kwargs["density"] = float(density)
+        contact = sdp.ContactParams()
+        contact.coulomb_friction_coefficient = _friction(cfg)
         actor = self._scene.create_rigid_actor(
             name=cfg.name,
             shape=shape,
             is_static=is_static,
             world_from_local=_transform_from_wxyz(cfg.default_position, cfg.default_orientation),
             has_gravity=bool(cfg.enabled_gravity),
+            contact=contact,
             **kwargs,
         )
         if actor is None:
@@ -305,15 +333,7 @@ class SuperdexHandler(BaseSimHandler):
         prefab.name = cfg.name
         fix_base = bool(cfg.fix_base_link)
         prefab.joints[0].type = sdp.ArticulatedJointType.HARD if fix_base else sdp.ArticulatedJointType.FREE
-        if not cfg.enabled_gravity:
-            # Same semantics as the MuJoCo backend's gravity compensation (``enabled_gravity=False`` on
-            # e.g. FrankaCfg): the links feel no gravity, so PD targets hold without sag.
-            links = prefab.links
-            for i in range(len(links)):
-                link = links[i]
-                link.has_gravity = False
-                links[i] = link
-            prefab.links = links
+        self._apply_link_and_joint_params(cfg, prefab, baked)
 
         link_names = [link.name for link in prefab.links]
         joint_names: list[str] = []
@@ -333,6 +353,19 @@ class SuperdexHandler(BaseSimHandler):
                 )
             n_joint_dofs += ndof
 
+        if not fix_base:
+            massless = [
+                prefab.links[i].name
+                for i in range(len(prefab.links))
+                if prefab.links[i].mass is None and prefab.links[i].density is None
+            ]
+            if massless and not (baked.link_inertials or baked.link_masses):
+                pass  # engine derives every mass from hull volume x default density: consistent, allowed
+            elif massless:
+                raise ValueError(
+                    f"[superdex] '{cfg.name}' has a free base but links {massless} carry no <inertial> mass "
+                    "(the solver goes singular and the body never moves); add inertials to the URDF or set fix_base_link=True"
+                )
         bot = sdr.create_bot(self._scene, prefab, self._robotics_ctx)
         if bot is None:
             raise RuntimeError(f"[superdex] create_bot failed for '{cfg.name}' ({baked.path})")
@@ -378,6 +411,50 @@ class SuperdexHandler(BaseSimHandler):
                 if geoms:
                     self._renderer.add_body(cfg.name, link, geoms)
 
+    def _apply_link_and_joint_params(self, cfg: ArticulationObjCfg, prefab, baked: _assets.BakedUrdf) -> None:
+        """Align per-link / per-joint physics with what the other backends read from the same URDF.
+
+        * mass, centre of mass and inertia tensor from ``<inertial>`` (SuperDex's URDF loader leaves them
+          unset and would derive mass from hull volume x default density);
+        * Coulomb friction from ``static_friction`` or the MuJoCo-compatible default;
+        * ``enabled_gravity=False`` -> no gravity on any link (the MuJoCo backend's gravity compensation);
+        * stiff joint-limit penalties so URDF ranges behave like hard limits.
+        """
+        links = prefab.links
+        friction = _friction(cfg)
+        inertials = baked.link_inertials
+        if not inertials and getattr(cfg, "mjcf_path", None) and os.path.isfile(cfg.mjcf_path):
+            inertials = _assets.mjcf_inertials(cfg.mjcf_path)
+            if inertials:
+                log.info(
+                    f"[superdex] '{cfg.name}': URDF has no <inertial>; using the explicit MJCF inertials of "
+                    f"{len(inertials)} bodies from {cfg.mjcf_path} so mass distribution matches the MuJoCo backend"
+                )
+        for i in range(len(links)):
+            link = links[i]
+            inertial = inertials.get(link.name)
+            if inertial is not None:
+                link.mass = float(inertial.mass)
+                link.density = None
+                link.center_of_mass = inertial.com.tolist()
+                t = inertial.inertia
+                link.moment_of_inertia = [t[0, 0], t[0, 1], t[0, 2], t[1, 1], t[1, 2], t[2, 2]]
+            contact = link.contact
+            contact.coulomb_friction_coefficient = friction
+            link.contact = contact
+            if not cfg.enabled_gravity:
+                link.has_gravity = False
+            links[i] = link
+        prefab.links = links
+        joints = prefab.joints
+        for i in range(1, len(joints)):
+            joint = joints[i]
+            if _joint_dofs(joint.type) == 1:
+                joint.limit_stiffness = JOINT_LIMIT_STIFFNESS
+                joint.limit_damping = JOINT_LIMIT_DAMPING
+                joints[i] = joint
+        prefab.joints = joints
+
     def _attach_pose_controller(self, art: _Articulation, initial_pose: np.ndarray) -> None:
         """Turn ``RobotCfg.actuators`` gains into SuperDex's implicit per-joint pose controller."""
         cfg: RobotCfg = art.cfg  # type: ignore[assignment]
@@ -402,7 +479,7 @@ class SuperdexHandler(BaseSimHandler):
             # Effort clamp precedence mirrors the MuJoCo backend: an explicit ``effort_limit_sim`` wins,
             # otherwise the asset-authored limit (URDF ``<limit effort>``, which SuperDex parses into the
             # prefab but does not enforce on its own) stays active; negative = unbounded.
-            if act.effort_limit_sim:
+            if act.effort_limit_sim is not None:
                 p.saturation = float(act.effort_limit_sim)
             elif float(joint.effort_limit) > 0:
                 p.saturation = float(joint.effort_limit)
@@ -428,6 +505,7 @@ class SuperdexHandler(BaseSimHandler):
                     art.actor.set_external_forces_on_dofs(dof_indices=idx, force_values=art.effort.astype(np.float32))
             self._scene.step(self._dt)
             self._sim_time += self._dt
+        self._contact_queries_fresh = True
         self._push_render_poses()
 
     def refresh_render(self) -> None:
@@ -453,15 +531,26 @@ class SuperdexHandler(BaseSimHandler):
                 art.actor.set_articulated_target_pose(art.target_pose)
             vel_targets = payload.get("dof_vel_target")
             if vel_targets:
+                # Best effort, like the MuJoCo backend: the pose controller keeps pulling towards
+                # ``target_pose``; the velocity target only feeds its damping term.
                 vel = np.zeros(art.num_dofs, dtype=np.float64)
                 for jn, value in vel_targets.items():
-                    vel[art.joint_dof_index[jn]] = float(value)
+                    idx = art.joint_dof_index.get(jn)
+                    if idx is None:
+                        raise KeyError(f"[superdex] robot '{name}' has no joint '{jn}' (dof_vel_target)")
+                    vel[idx] = float(value)
                 art.actor.set_articulated_target_velocity(vel)
+                art.target_vel = vel
+            else:
+                art.target_vel = None
             effort_targets = payload.get("dof_effort_target")
             if effort_targets:
                 effort = np.zeros(art.num_dofs - art.base_dofs, dtype=np.float64)
                 for jn, value in effort_targets.items():
-                    effort[art.joint_dof_index[jn] - art.base_dofs] = float(value)
+                    idx = art.joint_dof_index.get(jn)
+                    if idx is None:
+                        raise KeyError(f"[superdex] robot '{name}' has no joint '{jn}' (dof_effort_target)")
+                    effort[idx - art.base_dofs] = float(value)
                 art.effort = effort
             elif art.effort is not None:
                 art.effort = None
@@ -486,12 +575,13 @@ class SuperdexHandler(BaseSimHandler):
             try:
                 lin = np.asarray(link_actor.get_linear_velocity(), dtype=np.float64)
                 ang = np.asarray(link_actor.get_angular_velocity(), dtype=np.float64)
-            except Exception:  # a welded root link carries no velocity component
+            except Exception as exc:  # a welded root link carries no velocity component
+                log.debug(f"[superdex] no velocity on link {art.link_names[i]!r}: {exc}")
                 lin = ang = np.zeros(3)
             link_states.append(np.concatenate([pos, quat, lin, ang]))
-        root_pos, root_quat = _wxyz_from_transform(art.actor.get_root_transform())
-        root_state = np.concatenate([root_pos, root_quat, link_states[0][7:13]])
-        return root_state, link_states
+        # ``get_root_transform`` is the *articulation root frame*; with a FREE base joint the base motion
+        # lives in the first six DoFs, so the world pose of link 0 is the only correct root pose.
+        return link_states[0].copy(), link_states
 
     def _joint_arrays(self, art: _Articulation) -> tuple[np.ndarray, np.ndarray]:
         pose = sdp.DynamicArrayReal(art.num_dofs)
@@ -519,14 +609,17 @@ class SuperdexHandler(BaseSimHandler):
             kwargs["joint_pos_target"] = (
                 torch.from_numpy(art.target_pose[idx]).float().unsqueeze(0) if art.target_pose is not None else None
             )
-            kwargs["joint_vel_target"] = None
+            kwargs["joint_vel_target"] = (
+                torch.from_numpy(art.target_vel[idx]).float().unsqueeze(0) if art.target_vel is not None else None
+            )
             effort = None
             if art.controlled:
                 try:
                     force = np.asarray(art.actor.get_articulated_controller_force(), dtype=np.float64)
                     if force.shape[0] == art.num_dofs:
                         effort = torch.from_numpy(force[idx]).float().unsqueeze(0)
-                except Exception:  # controller force readback is best-effort
+                except Exception as exc:  # controller force readback is best-effort
+                    log.debug(f"[superdex] controller force readback unavailable for '{art.cfg.name}': {exc}")
                     effort = None
             kwargs["joint_effort_target"] = effort
         return cls(**kwargs)
@@ -546,7 +639,7 @@ class SuperdexHandler(BaseSimHandler):
         if self._renderer is not None:
             self._push_render_poses()
             for cam in self.cameras:
-                rgb, depth = self._renderer.render(cam)
+                rgb, depth = self._renderer.render(cam, pose=self._mounted_camera_pose(cam))
                 camera_states[cam.name] = CameraState(
                     rgb=torch.from_numpy(rgb).unsqueeze(0) if "rgb" in cam.data_types else None,
                     depth=torch.from_numpy(depth).unsqueeze(0) if "depth" in cam.data_types else None,
@@ -556,8 +649,11 @@ class SuperdexHandler(BaseSimHandler):
     def _set_states(self, states: DictStateBatch, env_ids: list[int] | None = None) -> None:
         if len(states) != 1:
             raise ValueError(f"[superdex] single-env handler got {len(states)} env states")
-        flat = {**states[0].get("objects", {}), **states[0].get("robots", {})}
-        for name, obj_state in flat.items():
+        objects, robots = states[0].get("objects", {}), states[0].get("robots", {})
+        clash = set(objects) & set(robots)
+        if clash:
+            raise KeyError(f"[superdex] set_states: names used for both an object and a robot: {sorted(clash)}")
+        for name, obj_state in {**objects, **robots}.items():
             if name in self._rigids:
                 self._set_rigid_state(self._rigids[name], obj_state)
             elif name in self._articulations:
@@ -573,14 +669,15 @@ class SuperdexHandler(BaseSimHandler):
             rot = obj_state.get("rot", cur_quat)
             rigid.actor.set_root_transform(_transform_from_wxyz(pos, rot))
         if not rigid.is_static:
-            rigid.actor.set_velocity(_np(obj_state.get("vel", np.zeros(3))), _np(obj_state.get("ang_vel", np.zeros(3))))
+            rigid.actor.set_velocity(np.zeros(3), np.zeros(3))  # velocities are reset on set_states (as in MuJoCo)
 
     def _set_articulation_state(self, art: _Articulation, obj_state) -> None:
-        if "pos" in obj_state or "rot" in obj_state:
-            cur_pos, cur_quat = _wxyz_from_transform(art.actor.get_root_transform())
-            pos = obj_state.get("pos", cur_pos)
-            rot = obj_state.get("rot", cur_quat)
-            art.actor.set_root_transform(_transform_from_wxyz(pos, rot))
+        # Re-anchor the articulation root at the current world pose of link 0 (they differ once a free
+        # base has moved), then overwrite with the requested pos/rot. Base DoFs are zeroed below.
+        cur_pos, cur_quat = self._link_states(art)[0][:3], self._link_states(art)[0][3:7]
+        pos = obj_state.get("pos", cur_pos)
+        rot = obj_state.get("rot", cur_quat)
+        art.actor.set_root_transform(_transform_from_wxyz(pos, rot))
         pose, _ = self._joint_arrays(art)
         dof_pos = obj_state.get("dof_pos") or {}
         for jn, value in dof_pos.items():
@@ -610,6 +707,63 @@ class SuperdexHandler(BaseSimHandler):
         return sorted(art.link_names) if sort else list(art.link_names)
 
     # ------------------------------------------------------------------ rendering helpers
+    def _mounted_camera_pose(self, cam) -> np.ndarray | None:
+        """World pose (4x4) of a camera mounted on a link, or None for a world-fixed camera.
+
+        Same convention as the MuJoCo backend: ``mount_pos``/``mount_quat`` (wxyz) are the camera frame
+        in the link frame, and the camera looks down its -Z axis with +Y up (MuJoCo == OpenGL).
+        """
+        if cam.mount_to is None:
+            return None
+        art = self._articulations.get(cam.mount_to)
+        link_name = str(cam.mount_link).split("/")[-1]
+        if art is not None:
+            if link_name not in art.link_names:
+                raise KeyError(f"[superdex] camera '{cam.name}': '{cam.mount_to}' has no link '{link_name}'")
+            transforms = sdp.DynamicArrayTransformRT(len(art.link_names))
+            art.actor.get_articulated_link_transforms(transforms)
+            world_from_link = _matrix_from_transform(transforms[art.link_names.index(link_name)])
+        else:
+            world_from_link = _matrix_from_transform(self._rigids[cam.mount_to].actor.get_root_transform())
+        return world_from_link @ _matrix_from_transform(_transform_from_wxyz(cam.mount_pos, cam.mount_quat))
+
+    def get_contact_forces(self) -> torch.Tensor:
+        """Net contact force per body of the first robot, ``(num_bodies, 3)`` in ``get_body_names`` order.
+
+        Backs :class:`metasim.queries.contact_force.ContactForces`. SuperDex 1.0 exposes contact
+        queries only on actors that carry contact sample points: standalone mesh rigid actors do, but
+        articulation links and the implicit ground plane do not. The force on a robot link is therefore
+        assembled from the *other side*: every dynamic rigid object registers a TOTAL_CONTACT_FORCE
+        query and reports the force it receives from each link (``get_contact_force_from_actor_world``),
+        which is negated onto the link. Contacts with the ground plane, static objects and the
+        robot's own links are **not** observable this way; a one-time warning says so.
+        """
+        if not self.robots:
+            return torch.zeros((0, 3))
+        art = self._articulations[self.robots[0].name]
+        if not art.contact_queries:
+            dynamic = [r for r in self._rigids.values() if not r.is_static]
+            for rigid in dynamic:
+                art.contact_queries.append((rigid, rigid.actor.register_query(sdp.QueryType.TOTAL_CONTACT_FORCE)))
+            self._contact_queries_fresh = False
+            log.warning(
+                f"[superdex] ContactForces for '{art.cfg.name}': measured through the {len(dynamic)} dynamic rigid "
+                "object(s) it touches; ground-plane, static-object and self contacts are not observable "
+                "(SuperDex 1.0 has no contact sample points on articulation links)."
+            )
+        order = [art.link_names.index(n) for n in self._get_body_names(art.cfg.name, sort=True)]
+        forces = np.zeros((len(order), 3), dtype=np.float64)
+        if not self._contact_queries_fresh:
+            # query results only exist after the next simulation step
+            return torch.from_numpy(forces).float()
+        for rigid, _handle in art.contact_queries:
+            for row, i in enumerate(order):
+                f_on_obj = np.asarray(
+                    rigid.actor.get_contact_force_from_actor_world(art.link_actors[i]), dtype=np.float64
+                )
+                forces[row] -= f_on_obj
+        return torch.from_numpy(forces).float()
+
     def _push_render_poses(self) -> None:
         if self._renderer is None:
             return
