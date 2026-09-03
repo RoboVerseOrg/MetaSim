@@ -59,11 +59,13 @@ except ImportError as _exc:  # pragma: no cover - surfaced by get_sim_handler_cl
         "python -m pip install superdex-physics superdex-robotics  (or metasim[superdex])"
     ) from _exc
 
-DEFAULT_DT = 1.0 / 200.0
+DEFAULT_DT = 1.0 / 1000.0
 """Physics step used when ``ScenarioCfg.sim_params.dt`` is None.
 
-SuperDex's implicit integrator is stable at 10-25 ms; 5 ms keeps env-step timing
-(``dt * decimation``) close to the other CPU backends while leaving a wide stability margin.
+Same default as the MuJoCo backend (``mjcf_model.option.timestep = 0.001``), so an env step
+(``dt * decimation``) spans the same simulated time on both backends and drop / tracking
+trajectories line up step for step. SuperDex's implicit integrator would be stable at 10-25 ms;
+at 1 ms a Franka step costs ~0.1 ms, so the parity default is cheap.
 """
 
 DEFAULT_FRICTION = 1.0
@@ -74,7 +76,7 @@ JOINT_LIMIT_STIFFNESS = 5.0e6
 JOINT_LIMIT_DAMPING = 5.0e3
 """URDF limits are hard constraints in MuJoCo/PhysX; SuperDex models them as penalties (its URDF loader
 sets stiffness 100, which the pose controller pushes through). These gains make the range effectively
-hard at the 5 ms default step (measured on the Franka fingers: 100 -> 29 mm overshoot past the range,
+hard at the default step (measured on the Franka fingers: 100 -> 29 mm overshoot past the range,
 5e4 -> 1.2 mm, 5e6 -> 0.0 mm)."""
 
 _ONE_DOF_JOINTS = {"REVOLUTE", "PRISMATIC", "CYCLE"}
