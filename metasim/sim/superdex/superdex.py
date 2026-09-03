@@ -1,0 +1,622 @@
+"""SuperDex (Meta "Mochi" engine) backend for MetaSim.
+
+`SuperDex <https://github.com/facebookresearch/project_superdex>`_ is a contact-first, fully
+implicit rigid/articulated/soft-body engine with a Python API (``superdex.physics`` +
+``superdex.robotics``). This handler maps the :class:`~metasim.sim.base.BaseSimHandler` contract
+onto it:
+
+* **Scene** — one ``superdex.physics.Scene`` per handler (single environment; ``num_envs > 1``
+  is served by :class:`~metasim.sim.parallel.ParallelSimWrapper`, as for MuJoCo/PyBullet).
+* **Assets** — robots and articulated objects are loaded from URDF through
+  ``superdex.robotics.load_bot_prefab_from_urdf_file`` after :func:`~metasim.sim.superdex._assets.bake_urdf`
+  has replaced every collision geometry by a watertight hull (SuperDex bakes SDF colliders and
+  ignores URDF primitives). Primitive and mesh rigid objects become closed triangle-mesh actors.
+* **Control** — ``RobotCfg.actuators`` stiffness/damping/effort limits become the per-joint gains
+  of SuperDex's built-in *implicit* pose controller, so stiff PD targets stay stable at the
+  10-25 ms steps the engine is designed for. Velocity targets use the same controller; effort
+  targets are applied as external DoF forces.
+* **State** — root/body poses come from the actor and link transforms (SuperDex quaternions are
+  ``xyzw``; MetaSim's are ``wxyz``), joint state from the articulated pose/velocity arrays.
+* **Cameras** — SuperDex has no headless renderer, so RGB + depth are produced by
+  :class:`~metasim.sim.superdex._renderer.OffscreenRenderer` (pyrender/EGL) from the physics link
+  transforms. Segmentation and mounted cameras are not implemented and are rejected at launch.
+
+Known limitations (all reported loudly rather than silently ignored): CPU only; no GUI viewer;
+Python >= 3.12 (the ``superdex-*`` wheels); no instance segmentation; per-object friction /
+restitution from ``BaseRigidObjCfg`` are not yet forwarded.
+"""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass, field
+
+import numpy as np
+import torch
+from loguru import logger as log
+
+from metasim.scenario.objects import (
+    ArticulationObjCfg,
+    BaseObjCfg,
+    PrimitiveCubeCfg,
+    PrimitiveCylinderCfg,
+    PrimitiveSphereCfg,
+    RigidObjCfg,
+)
+from metasim.scenario.robot import RobotCfg
+from metasim.scenario.scenario import ScenarioCfg
+from metasim.sim.base import BaseSimHandler
+from metasim.sim.superdex import _assets
+from metasim.types import CameraState, CompatActionInput, DictStateBatch, ObjectState, RobotState, TensorState
+from metasim.utils.state import adapt_actions_to_dict
+
+try:
+    import superdex.physics as sdp
+    import superdex.robotics as sdr
+except ImportError as _exc:  # pragma: no cover - surfaced by get_sim_handler_class with an install hint
+    raise ImportError(
+        "SuperDex is not installed. It ships Python >= 3.12 wheels: "
+        "python -m pip install superdex-physics superdex-robotics  (or metasim[superdex])"
+    ) from _exc
+
+DEFAULT_DT = 1.0 / 200.0
+"""Physics step used when ``ScenarioCfg.sim_params.dt`` is None.
+
+SuperDex's implicit integrator is stable at 10-25 ms; 5 ms keeps env-step timing
+(``dt * decimation``) close to the other CPU backends while leaving a wide stability margin.
+"""
+
+_ONE_DOF_JOINTS = {"REVOLUTE", "PRISMATIC", "CYCLE"}
+_PRIMITIVE_CFGS = (PrimitiveCubeCfg, PrimitiveSphereCfg, PrimitiveCylinderCfg)
+
+
+def _joint_type_name(joint_type) -> str:
+    return str(joint_type).split(".")[-1].upper()
+
+
+def _joint_dofs(joint_type) -> int:
+    name = _joint_type_name(joint_type)
+    if name in _ONE_DOF_JOINTS:
+        return 1
+    if name == "SPHERICAL":
+        return 3
+    if name == "FREE":
+        return 6
+    return 0  # HARD
+
+
+def _np(x) -> np.ndarray:
+    if isinstance(x, torch.Tensor):
+        return x.detach().cpu().numpy().astype(np.float64)
+    return np.asarray(x, dtype=np.float64)
+
+
+def _transform_from_wxyz(pos, quat_wxyz):
+    q = _np(quat_wxyz)
+    return sdp.TransformRT(rotation=[q[1], q[2], q[3], q[0]], translation=_np(pos).tolist())
+
+
+def _wxyz_from_transform(tf) -> tuple[np.ndarray, np.ndarray]:
+    rot = tf.rotation
+    quat = np.array([rot[3], rot[0], rot[1], rot[2]], dtype=np.float64)  # xyzw -> wxyz
+    return np.asarray(tf.translation, dtype=np.float64), quat
+
+
+def _matrix_from_transform(tf) -> np.ndarray:
+    pos, q = _wxyz_from_transform(tf)
+    w, x, y, z = q
+    mat = np.eye(4)
+    mat[:3, :3] = np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+    ])
+    mat[:3, 3] = pos
+    return mat
+
+
+@dataclass
+class _Articulation:
+    """Book-keeping for one articulated actor (robot or ArticulationObjCfg)."""
+
+    cfg: BaseObjCfg
+    bot: object
+    actor: object
+    prefab: object
+    baked: _assets.BakedUrdf
+    link_names: list[str]
+    joint_names: list[str]
+    """1-DoF joint names in actor DoF order (SuperDex joint order minus the root and fixed joints)."""
+    joint_dof_index: dict[str, int]
+    base_dofs: int
+    num_dofs: int
+    controlled: bool = False
+    target_pose: np.ndarray | None = None
+    effort: np.ndarray | None = None
+    link_actors: list = field(default_factory=list)
+
+
+@dataclass
+class _Rigid:
+    cfg: BaseObjCfg
+    actor: object
+    is_static: bool
+
+
+class SuperdexHandler(BaseSimHandler):
+    """MetaSim handler backed by SuperDex Physics (see module docstring)."""
+
+    _set_states_input_type = "dict"
+
+    def __init__(self, scenario: ScenarioCfg, optional_queries=None):
+        super().__init__(scenario, optional_queries)
+        self._scene = None
+        self._robotics_ctx = None
+        self._articulations: dict[str, _Articulation] = {}
+        self._rigids: dict[str, _Rigid] = {}
+        self._renderer = None
+        self._dt = scenario.sim_params.dt if scenario.sim_params.dt is not None else DEFAULT_DT
+        self._num_threads = int(getattr(scenario.sim_params, "num_threads", 0) or 0)
+        self._cache_dir = _assets.default_cache_dir()
+        self._sim_time = 0.0
+
+    # ------------------------------------------------------------------ lifecycle
+    def launch(self) -> None:
+        if not self.headless:
+            log.warning("[superdex] SuperDex has no interactive viewer; running headless (cameras still render).")
+        self._validate_cameras()
+        if not sdp.is_initialized():
+            sdp.initialize(num_worker_threads=self._num_threads)
+        self._scene = sdp.create_scene(f"metasim-{os.getpid()}-{id(self)}")
+        self._scene.set_gravity([float(g) for g in self.scenario.gravity])
+        self._robotics_ctx = sdr.create_context()
+
+        if self.cameras:
+            from metasim.sim.superdex._renderer import OffscreenRenderer
+
+            self._renderer = OffscreenRenderer()
+
+        if self.scenario.add_default_ground:
+            plane = sdp.create_plane_shape(normal=[0.0, 0.0, 1.0], distance=0.0)
+            self._scene.create_rigid_actor(name="ground", shape=plane, is_static=True)
+            if self._renderer is not None:
+                self._renderer.add_ground()
+
+        for obj in self.objects:
+            self._add_object(obj)
+        for robot in self.robots:
+            self._add_articulation(robot, is_robot=True)
+
+        self._push_render_poses()
+        super().launch()
+
+    def close(self) -> None:
+        if self._renderer is not None:
+            self._renderer.close()
+            self._renderer = None
+        if self._scene is not None:
+            for art in self._articulations.values():
+                try:
+                    sdr.destroy_bot(self._scene, art.bot)
+                except Exception as exc:  # engine teardown must not mask the caller's exception
+                    log.debug(f"[superdex] destroy_bot({art.cfg.name}) during close: {exc}")
+            self._articulations.clear()
+            self._rigids.clear()
+            sdp.destroy_scene(self._scene)
+            self._scene = None
+        self._robotics_ctx = None
+
+    @property
+    def device(self) -> torch.device:
+        return torch.device("cpu")
+
+    @property
+    def scene(self):
+        """The underlying ``superdex.physics.Scene`` (for advanced users / tests)."""
+        return self._scene
+
+    # ------------------------------------------------------------------ scene construction
+    def _validate_cameras(self) -> None:
+        for cam in self.cameras:
+            unsupported = [dt for dt in cam.data_types if dt not in ("rgb", "depth")]
+            if unsupported:
+                raise NotImplementedError(
+                    f"[superdex] camera '{cam.name}' requests {unsupported}; the SuperDex backend renders rgb/depth only"
+                )
+            if cam.mount_to is not None:
+                raise NotImplementedError(f"[superdex] camera '{cam.name}': mounted cameras are not implemented yet")
+
+    def _add_object(self, cfg: BaseObjCfg) -> None:
+        if isinstance(cfg, ArticulationObjCfg):
+            self._add_articulation(cfg, is_robot=False)
+        elif isinstance(cfg, _PRIMITIVE_CFGS):
+            mesh = _assets.primitive_trimesh(cfg)
+            color = tuple(cfg.color) if getattr(cfg, "color", None) else None
+            self._add_rigid_mesh(cfg, mesh, mass=float(cfg.mass), density=None, visuals=[(mesh, np.eye(4), color)])
+        elif isinstance(cfg, RigidObjCfg):
+            self._add_rigid_from_file(cfg)
+        else:
+            raise NotImplementedError(f"[superdex] object type {type(cfg).__name__} ('{cfg.name}') is not supported")
+
+    def _add_rigid_mesh(self, cfg, mesh, *, mass, density, visuals) -> None:
+        coords, conn = _assets.mesh_to_arrays(_assets.watertight_hull(mesh))
+        shape = sdp.create_tri_mesh_shape(coordinates=coords, connectivity=conn)
+        is_static = bool(cfg.fix_base_link)
+        kwargs = {}
+        if not is_static:
+            if mass is not None:
+                kwargs["mass"] = float(mass)
+            elif density is not None:
+                kwargs["density"] = float(density)
+        actor = self._scene.create_rigid_actor(
+            name=cfg.name,
+            shape=shape,
+            is_static=is_static,
+            world_from_local=_transform_from_wxyz(cfg.default_position, cfg.default_orientation),
+            has_gravity=bool(cfg.enabled_gravity),
+            **kwargs,
+        )
+        if actor is None:
+            raise RuntimeError(f"[superdex] failed to create rigid actor '{cfg.name}'")
+        self._rigids[cfg.name] = _Rigid(cfg=cfg, actor=actor, is_static=is_static)
+        if self._renderer is not None:
+            self._renderer.add_body(cfg.name, cfg.name, visuals)
+
+    def _add_rigid_from_file(self, cfg: RigidObjCfg) -> None:
+        import trimesh
+
+        path = cfg.urdf_path or cfg.mesh_path
+        if path is None:
+            raise ValueError(f"[superdex] rigid object '{cfg.name}' needs a urdf_path or mesh_path")
+        scale = cfg.scale if isinstance(cfg.scale, (tuple, list)) else (cfg.scale,) * 3
+        visuals = []
+        if path.lower().endswith(".urdf"):
+            baked = _assets.bake_urdf(path, scale=tuple(float(s) for s in scale), cache_dir=self._cache_dir)
+            if len(baked.link_names) > 1:
+                log.warning(
+                    f"[superdex] rigid object '{cfg.name}' URDF has {len(baked.link_names)} links; "
+                    "loading it as ONE rigid body (use ArticulationObjCfg for jointed assets)"
+                )
+            hull_meshes = []
+            for link in baked.link_names:
+                for hull_path, link_from_geom in baked.collisions.get(link, []):
+                    hull = trimesh.load(hull_path, force="mesh")
+                    hull.apply_transform(link_from_geom)
+                    hull_meshes.append(hull)
+                for vis in baked.visuals.get(link, []):
+                    visuals.append((vis.mesh, vis.link_from_geom, vis.color))
+            if not hull_meshes:
+                raise ValueError(f"[superdex] rigid object '{cfg.name}': URDF has no collision geometry")
+            mesh = trimesh.util.concatenate(hull_meshes) if len(hull_meshes) > 1 else hull_meshes[0]
+            mass = baked.link_masses.get(baked.link_names[0]) if baked.link_masses else None
+        else:
+            mesh = trimesh.load(path, force="mesh")
+            mesh.apply_scale(np.asarray(scale, dtype=np.float64))
+            visuals.append((mesh, np.eye(4), None))
+            mass = None
+        self._add_rigid_mesh(cfg, mesh, mass=mass, density=cfg.mesh_density, visuals=visuals)
+
+    def _add_articulation(self, cfg: ArticulationObjCfg, *, is_robot: bool) -> None:
+        if cfg.urdf_path is None:
+            raise ValueError(f"[superdex] '{cfg.name}' needs a urdf_path (SuperDex loads URDF only)")
+        scale = cfg.scale if isinstance(cfg.scale, (tuple, list)) else (cfg.scale,) * 3
+        baked = _assets.bake_urdf(cfg.urdf_path, scale=tuple(float(s) for s in scale), cache_dir=self._cache_dir)
+        prefab = sdr.load_bot_prefab_from_urdf_file(baked.path)
+        prefab.name = cfg.name
+        fix_base = bool(cfg.fix_base_link)
+        prefab.joints[0].type = sdp.ArticulatedJointType.HARD if fix_base else sdp.ArticulatedJointType.FREE
+        if not cfg.enabled_gravity:
+            # Same semantics as the MuJoCo backend's gravity compensation (``enabled_gravity=False`` on
+            # e.g. FrankaCfg): the links feel no gravity, so PD targets hold without sag.
+            links = prefab.links
+            for i in range(len(links)):
+                link = links[i]
+                link.has_gravity = False
+                links[i] = link
+            prefab.links = links
+
+        link_names = [link.name for link in prefab.links]
+        joint_names: list[str] = []
+        joint_dof_index: dict[str, int] = {}
+        n_joint_dofs = 0
+        # SuperDex joint i is the parent joint of link i; index 0 is the injected root joint.
+        for i in range(1, len(prefab.joints)):
+            joint = prefab.joints[i]
+            ndof = _joint_dofs(joint.type)
+            if ndof == 1:
+                joint_names.append(joint.name)
+                joint_dof_index[joint.name] = n_joint_dofs  # offset by base_dofs below
+            elif ndof > 1:
+                raise NotImplementedError(
+                    f"[superdex] '{cfg.name}': joint '{joint.name}' is {_joint_type_name(joint.type)}; "
+                    "only 1-DoF joints map onto MetaSim's scalar joint state"
+                )
+            n_joint_dofs += ndof
+
+        bot = sdr.create_bot(self._scene, prefab, self._robotics_ctx)
+        if bot is None:
+            raise RuntimeError(f"[superdex] create_bot failed for '{cfg.name}' ({baked.path})")
+        actor = bot.get_articulated_actor()
+        num_dofs = int(actor.get_num_dofs())
+        base_dofs = num_dofs - n_joint_dofs
+        if base_dofs not in (0, 6):
+            raise RuntimeError(
+                f"[superdex] '{cfg.name}': actor has {num_dofs} DoFs but the URDF joints account for {n_joint_dofs}"
+            )
+        joint_dof_index = {name: idx + base_dofs for name, idx in joint_dof_index.items()}
+
+        art = _Articulation(
+            cfg=cfg,
+            bot=bot,
+            actor=actor,
+            prefab=prefab,
+            baked=baked,
+            link_names=link_names,
+            joint_names=joint_names,
+            joint_dof_index=joint_dof_index,
+            base_dofs=base_dofs,
+            num_dofs=num_dofs,
+        )
+        art.link_actors = [self._scene.get_actor(h) for h in actor.get_nested_link_actors()]
+        self._articulations[cfg.name] = art
+
+        actor.set_root_transform(_transform_from_wxyz(cfg.default_position, cfg.default_orientation))
+        pose = np.zeros(num_dofs, dtype=np.float64)
+        defaults = getattr(cfg, "default_joint_positions", None) or {}
+        for name, value in defaults.items():
+            if name in joint_dof_index:
+                pose[joint_dof_index[name]] = float(value)
+        actor.set_articulated_pose_from_joints(pose)
+        actor.set_articulated_joint_velocities(np.zeros(num_dofs))
+
+        if is_robot:
+            self._attach_pose_controller(art, pose)
+
+        if self._renderer is not None:
+            for link in link_names:
+                geoms = [(v.mesh, v.link_from_geom, v.color) for v in baked.visuals.get(link, [])]
+                if geoms:
+                    self._renderer.add_body(cfg.name, link, geoms)
+
+    def _attach_pose_controller(self, art: _Articulation, initial_pose: np.ndarray) -> None:
+        """Turn ``RobotCfg.actuators`` gains into SuperDex's implicit per-joint pose controller."""
+        cfg: RobotCfg = art.cfg  # type: ignore[assignment]
+        actuators = cfg.actuators or {}
+        n_links = len(art.link_names)
+        params = sdp.PoseControllerParams(num_links=n_links)
+        tracking = params.joint_tracking
+        missing: list[str] = []
+        for i in range(1, n_links):
+            joint = art.prefab.joints[i]
+            if _joint_dofs(joint.type) != 1:
+                continue
+            act = actuators.get(joint.name)
+            if act is None:
+                missing.append(joint.name)
+                continue
+            if not act.fully_actuated:
+                continue
+            p = tracking[i]
+            p.stiffness = float(act.stiffness) if act.stiffness is not None else 0.0
+            p.damping = float(act.damping) if act.damping is not None else 0.0
+            # Effort clamp precedence mirrors the MuJoCo backend: an explicit ``effort_limit_sim`` wins,
+            # otherwise the asset-authored limit (URDF ``<limit effort>``, which SuperDex parses into the
+            # prefab but does not enforce on its own) stays active; negative = unbounded.
+            if act.effort_limit_sim:
+                p.saturation = float(act.effort_limit_sim)
+            elif float(joint.effort_limit) > 0:
+                p.saturation = float(joint.effort_limit)
+            else:
+                p.saturation = -1.0
+            tracking[i] = p
+        if missing:
+            log.warning(
+                f"[superdex] robot '{cfg.name}': joints {missing} have no entry in RobotCfg.actuators and stay passive"
+            )
+        params.joint_tracking = tracking
+        art.actor.add_articulated_pose_controller(params)
+        art.controlled = True
+        art.target_pose = initial_pose.copy()
+        art.actor.set_articulated_target_pose(art.target_pose)
+
+    # ------------------------------------------------------------------ simulation
+    def _simulate(self) -> None:
+        for _ in range(self.decimation):
+            for art in self._articulations.values():
+                if art.effort is not None:
+                    idx = np.arange(art.base_dofs, art.num_dofs, dtype=np.int32)
+                    art.actor.set_external_forces_on_dofs(dof_indices=idx, force_values=art.effort.astype(np.float32))
+            self._scene.step(self._dt)
+            self._sim_time += self._dt
+        self._push_render_poses()
+
+    def refresh_render(self) -> None:
+        self._push_render_poses()
+
+    # ------------------------------------------------------------------ actions
+    def _set_dof_targets(self, actions: CompatActionInput) -> None:
+        self._actions_cache = actions
+        per_robot = adapt_actions_to_dict(self, actions)
+        for name, payload in per_robot.items():
+            art = self._articulations.get(name)
+            if art is None:
+                raise KeyError(f"[superdex] action for unknown robot '{name}'")
+            if not art.controlled:
+                raise RuntimeError(f"[superdex] '{name}' has no controller (it is not a RobotCfg)")
+            pos_targets = payload.get("dof_pos_target")
+            if pos_targets:
+                for jn, value in pos_targets.items():
+                    idx = art.joint_dof_index.get(jn)
+                    if idx is None:
+                        raise KeyError(f"[superdex] robot '{name}' has no joint '{jn}'")
+                    art.target_pose[idx] = float(value)
+                art.actor.set_articulated_target_pose(art.target_pose)
+            vel_targets = payload.get("dof_vel_target")
+            if vel_targets:
+                vel = np.zeros(art.num_dofs, dtype=np.float64)
+                for jn, value in vel_targets.items():
+                    vel[art.joint_dof_index[jn]] = float(value)
+                art.actor.set_articulated_target_velocity(vel)
+            effort_targets = payload.get("dof_effort_target")
+            if effort_targets:
+                effort = np.zeros(art.num_dofs - art.base_dofs, dtype=np.float64)
+                for jn, value in effort_targets.items():
+                    effort[art.joint_dof_index[jn] - art.base_dofs] = float(value)
+                art.effort = effort
+            elif art.effort is not None:
+                art.effort = None
+
+    # ------------------------------------------------------------------ state I/O
+    def _rigid_root_state(self, rigid: _Rigid) -> np.ndarray:
+        pos, quat = _wxyz_from_transform(rigid.actor.get_root_transform())
+        if rigid.is_static:
+            lin = ang = np.zeros(3)
+        else:
+            lin = np.asarray(rigid.actor.get_linear_velocity(), dtype=np.float64)
+            ang = np.asarray(rigid.actor.get_angular_velocity(), dtype=np.float64)
+        return np.concatenate([pos, quat, lin, ang])
+
+    def _link_states(self, art: _Articulation) -> tuple[np.ndarray, list[np.ndarray]]:
+        """Return (root_state (13,), per-link states in SuperDex link order)."""
+        transforms = sdp.DynamicArrayTransformRT(len(art.link_names))
+        art.actor.get_articulated_link_transforms(transforms)
+        link_states = []
+        for i, link_actor in enumerate(art.link_actors):
+            pos, quat = _wxyz_from_transform(transforms[i])
+            try:
+                lin = np.asarray(link_actor.get_linear_velocity(), dtype=np.float64)
+                ang = np.asarray(link_actor.get_angular_velocity(), dtype=np.float64)
+            except Exception:  # a welded root link carries no velocity component
+                lin = ang = np.zeros(3)
+            link_states.append(np.concatenate([pos, quat, lin, ang]))
+        root_pos, root_quat = _wxyz_from_transform(art.actor.get_root_transform())
+        root_state = np.concatenate([root_pos, root_quat, link_states[0][7:13]])
+        return root_state, link_states
+
+    def _joint_arrays(self, art: _Articulation) -> tuple[np.ndarray, np.ndarray]:
+        pose = sdp.DynamicArrayReal(art.num_dofs)
+        vel = sdp.DynamicArrayReal(art.num_dofs)
+        art.actor.get_articulated_pose(pose)
+        art.actor.get_articulated_joint_velocities(vel)
+        return np.asarray(pose, dtype=np.float64), np.asarray(vel, dtype=np.float64)
+
+    def _articulation_state(self, art: _Articulation, cls):
+        root_state, link_states = self._link_states(art)
+        body_names = self._get_body_names(art.cfg.name, sort=True)
+        body_order = [art.link_names.index(n) for n in body_names]
+        body_state = np.stack([link_states[i] for i in body_order]) if body_order else np.zeros((0, 13))
+        pose, vel = self._joint_arrays(art)
+        joint_names = self._get_joint_names(art.cfg.name, sort=True)
+        idx = [art.joint_dof_index[n] for n in joint_names]
+        kwargs = dict(
+            root_state=torch.from_numpy(root_state).float().unsqueeze(0),
+            body_names=body_names,
+            body_state=torch.from_numpy(body_state).float().unsqueeze(0),
+            joint_pos=torch.from_numpy(pose[idx]).float().unsqueeze(0),
+            joint_vel=torch.from_numpy(vel[idx]).float().unsqueeze(0),
+        )
+        if cls is RobotState:
+            kwargs["joint_pos_target"] = (
+                torch.from_numpy(art.target_pose[idx]).float().unsqueeze(0) if art.target_pose is not None else None
+            )
+            kwargs["joint_vel_target"] = None
+            effort = None
+            if art.controlled:
+                try:
+                    force = np.asarray(art.actor.get_articulated_controller_force(), dtype=np.float64)
+                    if force.shape[0] == art.num_dofs:
+                        effort = torch.from_numpy(force[idx]).float().unsqueeze(0)
+                except Exception:  # controller force readback is best-effort
+                    effort = None
+            kwargs["joint_effort_target"] = effort
+        return cls(**kwargs)
+
+    def _get_states(self, env_ids: list[int] | None = None) -> TensorState:
+        object_states: dict[str, ObjectState] = {}
+        for obj in self.objects:
+            if obj.name in self._articulations:
+                object_states[obj.name] = self._articulation_state(self._articulations[obj.name], ObjectState)
+            else:
+                root = self._rigid_root_state(self._rigids[obj.name])
+                object_states[obj.name] = ObjectState(root_state=torch.from_numpy(root).float().unsqueeze(0))
+        robot_states: dict[str, RobotState] = {}
+        for robot in self.robots:
+            robot_states[robot.name] = self._articulation_state(self._articulations[robot.name], RobotState)
+        camera_states: dict[str, CameraState] = {}
+        if self._renderer is not None:
+            self._push_render_poses()
+            for cam in self.cameras:
+                rgb, depth = self._renderer.render(cam)
+                camera_states[cam.name] = CameraState(
+                    rgb=torch.from_numpy(rgb).unsqueeze(0) if "rgb" in cam.data_types else None,
+                    depth=torch.from_numpy(depth).unsqueeze(0) if "depth" in cam.data_types else None,
+                )
+        return TensorState(objects=object_states, robots=robot_states, cameras=camera_states, extras={})
+
+    def _set_states(self, states: DictStateBatch, env_ids: list[int] | None = None) -> None:
+        if len(states) != 1:
+            raise ValueError(f"[superdex] single-env handler got {len(states)} env states")
+        flat = {**states[0].get("objects", {}), **states[0].get("robots", {})}
+        for name, obj_state in flat.items():
+            if name in self._rigids:
+                self._set_rigid_state(self._rigids[name], obj_state)
+            elif name in self._articulations:
+                self._set_articulation_state(self._articulations[name], obj_state)
+            else:
+                raise KeyError(f"[superdex] set_states: unknown object '{name}'")
+        self._push_render_poses()
+
+    def _set_rigid_state(self, rigid: _Rigid, obj_state) -> None:
+        if "pos" in obj_state or "rot" in obj_state:
+            cur_pos, cur_quat = _wxyz_from_transform(rigid.actor.get_root_transform())
+            pos = obj_state.get("pos", cur_pos)
+            rot = obj_state.get("rot", cur_quat)
+            rigid.actor.set_root_transform(_transform_from_wxyz(pos, rot))
+        if not rigid.is_static:
+            rigid.actor.set_velocity(_np(obj_state.get("vel", np.zeros(3))), _np(obj_state.get("ang_vel", np.zeros(3))))
+
+    def _set_articulation_state(self, art: _Articulation, obj_state) -> None:
+        if "pos" in obj_state or "rot" in obj_state:
+            cur_pos, cur_quat = _wxyz_from_transform(art.actor.get_root_transform())
+            pos = obj_state.get("pos", cur_pos)
+            rot = obj_state.get("rot", cur_quat)
+            art.actor.set_root_transform(_transform_from_wxyz(pos, rot))
+        pose, _ = self._joint_arrays(art)
+        dof_pos = obj_state.get("dof_pos") or {}
+        for jn, value in dof_pos.items():
+            idx = art.joint_dof_index.get(jn)
+            if idx is None:
+                raise KeyError(f"[superdex] set_states: '{art.cfg.name}' has no joint '{jn}'")
+            pose[idx] = float(_np(value))
+        if art.base_dofs:
+            pose[: art.base_dofs] = 0.0  # base offset is carried by the root transform
+        art.actor.set_articulated_pose_from_joints(pose)
+        art.actor.set_articulated_joint_velocities(np.zeros(art.num_dofs))
+        if art.controlled:
+            art.target_pose = pose.copy()
+            art.actor.set_articulated_target_pose(art.target_pose)
+
+    # ------------------------------------------------------------------ names
+    def _get_joint_names(self, obj_name: str, sort: bool = True) -> list[str]:
+        art = self._articulations.get(obj_name)
+        if art is None:
+            return []
+        return sorted(art.joint_names) if sort else list(art.joint_names)
+
+    def _get_body_names(self, obj_name: str, sort: bool = True) -> list[str]:
+        art = self._articulations.get(obj_name)
+        if art is None:
+            return [obj_name] if obj_name in self._rigids else []
+        return sorted(art.link_names) if sort else list(art.link_names)
+
+    # ------------------------------------------------------------------ rendering helpers
+    def _push_render_poses(self) -> None:
+        if self._renderer is None:
+            return
+        for name, rigid in self._rigids.items():
+            self._renderer.set_body_pose(name, name, _matrix_from_transform(rigid.actor.get_root_transform()))
+        for name, art in self._articulations.items():
+            transforms = sdp.DynamicArrayTransformRT(len(art.link_names))
+            art.actor.get_articulated_link_transforms(transforms)
+            for i, link in enumerate(art.link_names):
+                self._renderer.set_body_pose(name, link, _matrix_from_transform(transforms[i]))

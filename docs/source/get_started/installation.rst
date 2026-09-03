@@ -56,6 +56,10 @@ MuJoCo, SAPIEN2, SAPIEN3, Genesis, and PyBullet can be installed directly via ``
      - ``uv pip install -e ".[newton]"``
      - 3.10-3.12
      - 3.10
+   * - SuperDex
+     - ``uv pip install -e ".[superdex]"``
+     - 3.12
+     - 3.12
    * - IsaacSim v4.5.0
      - See below
      - 3.10
@@ -159,6 +163,32 @@ Then:
 
    where ``$CONDA_HOME`` is the path to your conda installation. It is typically ``~/anaconda3``, ``~/miniconda3`` or ``~/miniforge3``.
    You can also add it to your ``~/.bashrc`` to make it permanent.
+
+Install SuperDex (Meta Mochi engine)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+`SuperDex <https://github.com/facebookresearch/project_superdex>`__ is Meta's contact-first, fully
+implicit rigid/articulated/soft-body engine. Its ``superdex-physics`` / ``superdex-robotics`` wheels
+are published for **Python 3.12 only**, so use a dedicated 3.12 environment:
+
+.. code-block:: bash
+
+    uv venv --python 3.12 .venv-superdex && source .venv-superdex/bin/activate
+    uv pip install -e ".[dev,superdex]"
+
+Then select it like any other backend (``ScenarioCfg(simulator="superdex")`` or ``--sim superdex``).
+What to expect from the backend (see ``metasim/sim/superdex/superdex.py`` for the full list):
+
+- **Assets**: robots and articulated objects load from ``urdf_path``; primitives and mesh objects are
+  supported. Collision geometry is replaced by watertight convex hulls in a cache directory
+  (``$METASIM_SUPERDEX_CACHE``, default ``<tmp>/metasim_superdex_cache``) because SuperDex bakes SDF
+  colliders and ignores URDF primitives. MJCF/USD are not read.
+- **Control**: ``RobotCfg.actuators`` stiffness/damping/effort limits drive SuperDex's implicit pose
+  controller; position, velocity and effort targets are supported.
+- **Cameras**: RGB + depth are rendered offscreen with ``pyrender`` (EGL) from the physics link
+  transforms. Instance segmentation and mounted cameras are not implemented (launch fails loudly).
+- **Parallelism**: one scene per handler on the CPU; ``num_envs > 1`` uses worker processes, as for
+  MuJoCo/PyBullet. There is no GUI viewer; ``headless=False`` only logs a warning.
 
 Install Multiple Simulators
 ---------------------------
