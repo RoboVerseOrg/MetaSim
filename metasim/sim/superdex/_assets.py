@@ -189,6 +189,8 @@ class BakedUrdf:
     joint_names: list[str] = field(default_factory=list)
     """Joint names in document order (fixed joints included)."""
     joint_types: dict[str, str] = field(default_factory=dict)
+    joint_dynamics: dict[str, tuple[float, float]] = field(default_factory=dict)
+    """Per joint: URDF ``<dynamics damping friction>`` (viscous [N m s/rad], Coulomb [N m]) when present."""
     link_masses: dict[str, float] = field(default_factory=dict)
     link_inertials: dict[str, LinkInertial] = field(default_factory=dict)
     """Parsed ``<inertial>`` per link (mass, centre of mass, inertia tensor in the link frame)."""
@@ -222,6 +224,95 @@ def _parse_inertial(inertial: ET.Element, scale: np.ndarray) -> LinkInertial | N
         s2 = float(np.prod(scale) ** (2.0 / 3.0)) if not np.allclose(scale, 1.0) else 1.0
         tensor = tensor * s2
     return LinkInertial(mass=mass, com=com, inertia=tensor)
+
+
+def mjcf_actuator_limits(mjcf_path: str) -> dict[str, float]:
+    """Actuator ``forcerange`` magnitude per joint of an MJCF (``<general>``/``<position>``/``<motor>``).
+
+    The MuJoCo backend clamps its actuators with these (a launch warning there says the MJCF
+    ``forcerange`` "stays active"); when a cfg has both files, SuperDex uses the same clamp so that
+    closed-loop behaviour matches, instead of the URDF ``<limit effort>`` the two assets disagree on
+    (Franka: MJCF 40 N m vs URDF 87 / 12 N m). Class defaults are honoured.
+    """
+    root = ET.parse(mjcf_path).getroot()
+    class_defaults: dict[str | None, float | None] = {}
+
+    def _walk(default_el, inherited):
+        value = inherited
+        for tag in ("general", "position", "motor", "velocity"):
+            el = default_el.find(tag)
+            if el is not None and el.get("forcerange") is not None:
+                lo, hi = _as_vec(el.get("forcerange"), (0.0, 0.0))
+                value = float(max(abs(lo), abs(hi)))
+        class_defaults[default_el.get("class")] = value
+        for child in default_el.findall("default"):
+            _walk(child, value)
+
+    for top in root.findall("default"):
+        _walk(top, None)
+    out: dict[str, float] = {}
+    actuator_root = root.find("actuator")
+    if actuator_root is None:
+        return out
+    for act in actuator_root:
+        joint = act.get("joint")
+        if not joint:
+            continue
+        value = class_defaults.get(act.get("class"), class_defaults.get(None))
+        if act.get("forcerange") is not None:
+            lo, hi = _as_vec(act.get("forcerange"), (0.0, 0.0))
+            value = float(max(abs(lo), abs(hi)))
+        if value is not None and value > 0:
+            out[joint] = value
+    return out
+
+
+def mjcf_joint_dynamics(mjcf_path: str) -> dict[str, tuple[float, float]]:
+    """Explicit per-joint ``damping`` / ``frictionloss`` of an MJCF, keyed by joint name.
+
+    Fallback for URDFs without ``<dynamics>`` (the RoboVerse Franka): the MuJoCo backend reads these
+    from the MJCF, so SuperDex uses the same viscous damping and Coulomb friction. Class defaults
+    (``<default><joint damping=.../>``) are honoured for joints that do not set their own.
+    """
+    root = ET.parse(mjcf_path).getroot()
+    class_defaults: dict[str | None, tuple[float | None, float | None]] = {}
+
+    def _walk(default_el, inherited):
+        joint_el = default_el.find("joint")
+        damping, friction = inherited
+        if joint_el is not None:
+            if joint_el.get("damping") is not None:
+                damping = float(joint_el.get("damping"))
+            if joint_el.get("frictionloss") is not None:
+                friction = float(joint_el.get("frictionloss"))
+        class_defaults[default_el.get("class")] = (damping, friction)
+        for child in default_el.findall("default"):
+            _walk(child, (damping, friction))
+
+    for top in root.findall("default"):
+        _walk(top, (None, None))
+    out: dict[str, tuple[float, float]] = {}
+
+    def _visit(body_el, childclass):
+        cls = body_el.get("childclass", childclass)
+        for joint in body_el.findall("joint"):
+            name = joint.get("name")
+            if not name:
+                continue
+            damping, friction = class_defaults.get(joint.get("class", cls), class_defaults.get(None, (None, None)))
+            if joint.get("damping") is not None:
+                damping = float(joint.get("damping"))
+            if joint.get("frictionloss") is not None:
+                friction = float(joint.get("frictionloss"))
+            if damping is not None or friction is not None:
+                out[name] = (damping or 0.0, friction or 0.0)
+        for child in body_el.findall("body"):
+            _visit(child, cls)
+
+    worldbody = root.find("worldbody")
+    if worldbody is not None:
+        _visit(worldbody, None)
+    return out
 
 
 def mjcf_inertials(mjcf_path: str) -> dict[str, LinkInertial]:
@@ -381,6 +472,9 @@ def bake_urdf(
         jname = joint.get("name", "")
         baked.joint_names.append(jname)
         baked.joint_types[jname] = joint.get("type", "fixed")
+        dyn = joint.find("dynamics")
+        if dyn is not None and (dyn.get("damping") is not None or dyn.get("friction") is not None):
+            baked.joint_dynamics[jname] = (float(dyn.get("damping", 0.0)), float(dyn.get("friction", 0.0)))
         origin = joint.find("origin")
         if origin is not None and not np.allclose(scale_arr, 1.0):
             origin.set("xyz", " ".join(f"{v:.9g}" for v in _as_vec(origin.get("xyz"), (0, 0, 0)) * scale_arr))

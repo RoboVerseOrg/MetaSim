@@ -73,7 +73,7 @@ DEFAULT_FRICTION = 1.0
 (SuperDex's own default is 0.5)."""
 
 JOINT_LIMIT_STIFFNESS = 5.0e6
-JOINT_LIMIT_DAMPING = 5.0e3
+JOINT_LIMIT_DAMPING = 10.0
 """URDF limits are hard constraints in MuJoCo/PhysX; SuperDex models them as penalties (its URDF loader
 sets stiffness 100, which the pose controller pushes through). These gains make the range effectively
 hard at the default step (measured on the Franka fingers: 100 -> 29 mm overshoot past the range,
@@ -153,6 +153,11 @@ class _Articulation:
     target_pose: np.ndarray | None = None
     target_vel: np.ndarray | None = None
     effort: np.ndarray | None = None
+    kp: np.ndarray | None = None
+    """Per actor DoF PD gains / clamp (pd control mode); zero for uncontrolled DoFs."""
+    kd: np.ndarray | None = None
+    effort_limit: np.ndarray | None = None
+    last_tau: np.ndarray | None = None
     link_actors: list = field(default_factory=list)
     contact_queries: list = field(default_factory=list)
 
@@ -179,6 +184,11 @@ class SuperdexHandler(BaseSimHandler):
         self._dt = scenario.sim_params.dt if scenario.sim_params.dt is not None else DEFAULT_DT
         self._num_threads = int(getattr(scenario.sim_params, "num_threads", 0) or 0)
         self._cache_dir = _assets.default_cache_dir()
+        self._control_mode = getattr(scenario.sim_params, "superdex_control_mode", "pd")
+        if self._control_mode not in ("pd", "implicit"):
+            raise ValueError(
+                f"[superdex] unknown superdex_control_mode {self._control_mode!r} (expected 'pd' or 'implicit')"
+            )
         self._sim_time = 0.0
         self._contact_queries_fresh = False
 
@@ -371,6 +381,10 @@ class SuperdexHandler(BaseSimHandler):
         bot = sdr.create_bot(self._scene, prefab, self._robotics_ctx)
         if bot is None:
             raise RuntimeError(f"[superdex] create_bot failed for '{cfg.name}' ({baked.path})")
+        if getattr(cfg, "enabled_self_collisions", True) is False:
+            # Convex-hull colliders of neighbouring links overlap, so without this the arm fights its
+            # own contact penalties (a Franka needed > 12 N m just to hold joint 6 still).
+            self._scene.enable_layer_contact_symmetric(f"metasim/{cfg.name}", f"metasim/{cfg.name}", enable=False)
         actor = bot.get_articulated_actor()
         num_dofs = int(actor.get_num_dofs())
         base_dofs = num_dofs - n_joint_dofs
@@ -424,6 +438,9 @@ class SuperdexHandler(BaseSimHandler):
         """
         links = prefab.links
         friction = _friction(cfg)
+        # One contact layer per articulation so self-collision can be switched off as a whole
+        # (``enabled_self_collisions=False`` excludes every same-robot contact on the MuJoCo backend).
+        self_layer = f"metasim/{cfg.name}"
         inertials = baked.link_inertials
         if not inertials and getattr(cfg, "mjcf_path", None) and os.path.isfile(cfg.mjcf_path):
             inertials = _assets.mjcf_inertials(cfg.mjcf_path)
@@ -444,26 +461,56 @@ class SuperdexHandler(BaseSimHandler):
             contact = link.contact
             contact.coulomb_friction_coefficient = friction
             link.contact = contact
+            link.layer = self_layer
             if not cfg.enabled_gravity:
                 link.has_gravity = False
             links[i] = link
         prefab.links = links
+        # Joint damping / Coulomb friction: URDF <dynamics>, else the explicit MJCF values the MuJoCo
+        # backend uses, else zero (MuJoCo's default). SuperDex's URDF loader would otherwise inject a
+        # viscous friction of 10 N m s/rad on every joint, which alone halves a 40 N m step response.
+        dynamics = baked.joint_dynamics
+        if not dynamics and getattr(cfg, "mjcf_path", None) and os.path.isfile(cfg.mjcf_path):
+            dynamics = _assets.mjcf_joint_dynamics(cfg.mjcf_path)
+        actuators = getattr(cfg, "actuators", None) or {}
         joints = prefab.joints
         for i in range(1, len(joints)):
             joint = joints[i]
-            if _joint_dofs(joint.type) == 1:
-                joint.limit_stiffness = JOINT_LIMIT_STIFFNESS
-                joint.limit_damping = JOINT_LIMIT_DAMPING
-                joints[i] = joint
+            if _joint_dofs(joint.type) != 1:
+                continue
+            joint.limit_stiffness = JOINT_LIMIT_STIFFNESS
+            joint.limit_damping = JOINT_LIMIT_DAMPING
+            damping, coulomb = dynamics.get(joint.name, (0.0, 0.0))
+            act = actuators.get(joint.name)
+            if act is not None and getattr(act, "frictionloss", None) is not None:
+                coulomb = float(act.frictionloss)  # cfg override, as on MuJoCo
+            fric = joint.friction
+            fric.viscous = float(damping)
+            fric.coulomb = float(coulomb)
+            joint.friction = fric
+            if act is not None and getattr(act, "armature", None) is not None:
+                joint.inertia = float(act.armature)
+            joints[i] = joint
         prefab.joints = joints
 
     def _attach_pose_controller(self, art: _Articulation, initial_pose: np.ndarray) -> None:
-        """Turn ``RobotCfg.actuators`` gains into SuperDex's implicit per-joint pose controller."""
+        """Turn ``RobotCfg.actuators`` gains into the robot's joint controller.
+
+        ``pd`` mode (default) keeps per-DoF ``kp`` / ``kd`` / effort clamps and applies
+        ``clip(kp (q* - q) - kd (qd - qd*), +-limit)`` as an external DoF force every substep — the same
+        law and clamp as the MuJoCo backend's actuators. ``implicit`` mode hands the gains to SuperDex's
+        native constraint-based pose controller (its ``saturation`` is not an effort clamp in N m; the
+        controller converges in a few ms regardless of the limit).
+        """
         cfg: RobotCfg = art.cfg  # type: ignore[assignment]
         actuators = cfg.actuators or {}
         n_links = len(art.link_names)
-        params = sdp.PoseControllerParams(num_links=n_links)
-        tracking = params.joint_tracking
+        kp = np.zeros(art.num_dofs)
+        kd = np.zeros(art.num_dofs)
+        limit = np.full(art.num_dofs, np.inf)
+        mjcf_limits: dict[str, float] = {}
+        if getattr(cfg, "mjcf_path", None) and os.path.isfile(cfg.mjcf_path):
+            mjcf_limits = _assets.mjcf_actuator_limits(cfg.mjcf_path)
         missing: list[str] = []
         for i in range(1, n_links):
             joint = art.prefab.joints[i]
@@ -475,34 +522,78 @@ class SuperdexHandler(BaseSimHandler):
                 continue
             if not act.fully_actuated:
                 continue
-            p = tracking[i]
-            p.stiffness = float(act.stiffness) if act.stiffness is not None else 0.0
-            p.damping = float(act.damping) if act.damping is not None else 0.0
-            # Effort clamp precedence mirrors the MuJoCo backend: an explicit ``effort_limit_sim`` wins,
-            # otherwise the asset-authored limit (URDF ``<limit effort>``, which SuperDex parses into the
-            # prefab but does not enforce on its own) stays active; negative = unbounded.
+            dof = art.joint_dof_index[joint.name]
+            kp[dof] = float(act.stiffness) if act.stiffness is not None else 0.0
+            kd[dof] = float(act.damping) if act.damping is not None else 0.0
+            # Effort clamp precedence mirrors the MuJoCo backend: an explicit ``effort_limit_sim`` wins;
+            # otherwise the asset-authored clamp -- the MJCF actuator ``forcerange`` when the cfg also
+            # ships an MJCF (that is what the MuJoCo backend clamps with), else the URDF ``<limit effort>``
+            # (SuperDex parses it into the prefab but does not enforce it); otherwise unbounded.
             if act.effort_limit_sim is not None:
-                p.saturation = float(act.effort_limit_sim)
+                limit[dof] = float(act.effort_limit_sim)
+            elif joint.name in mjcf_limits:
+                limit[dof] = mjcf_limits[joint.name]
             elif float(joint.effort_limit) > 0:
-                p.saturation = float(joint.effort_limit)
-            else:
-                p.saturation = -1.0
-            tracking[i] = p
+                limit[dof] = float(joint.effort_limit)
         if missing:
             log.warning(
                 f"[superdex] robot '{cfg.name}': joints {missing} have no entry in RobotCfg.actuators and stay passive"
             )
-        params.joint_tracking = tracking
-        art.actor.add_articulated_pose_controller(params)
+        art.kp, art.kd, art.effort_limit = kp, kd, limit
         art.controlled = True
         art.target_pose = initial_pose.copy()
+        # Both modes use SuperDex's implicit pose controller for the spring/damper (an explicit PD with
+        # kd ~ 1e4 is unstable at any usable substep). ``pd`` mode additionally enforces the effort clamp
+        # by shaping the target every substep (see ``_apply_pd_torques``); ``implicit`` mode passes the
+        # clamp as the controller's own ``saturation`` (not an N m clamp in practice).
+        params = sdp.PoseControllerParams(num_links=n_links)
+        tracking = params.joint_tracking
+        for i in range(1, n_links):
+            joint = art.prefab.joints[i]
+            if _joint_dofs(joint.type) != 1 or kp[art.joint_dof_index[joint.name]] == 0.0:
+                continue
+            dof = art.joint_dof_index[joint.name]
+            p = tracking[i]
+            p.stiffness, p.damping = float(kp[dof]), float(kd[dof])
+            p.saturation = float(limit[dof]) if (self._control_mode == "implicit" and np.isfinite(limit[dof])) else -1.0
+            tracking[i] = p
+        params.joint_tracking = tracking
+        art.actor.add_articulated_pose_controller(params)
         art.actor.set_articulated_target_pose(art.target_pose)
+
+    def _apply_pd_torques(self, art: _Articulation) -> None:
+        """One substep of effort-clamped PD (pd control mode) plus any effort targets.
+
+        The MuJoCo backend applies ``clip(kp (q* - q) - kd qd, +-limit)``. An explicit torque with
+        kd ~ 1e4 is unstable at any usable substep, so the spring/damper stays inside SuperDex's
+        implicit controller and the effort clamp is enforced on the spring term by bounding the
+        target excursion: ``q_eff = q + clip(q* - q, +-limit / kp)`` keeps ``|kp (q_eff - q)| <= limit``
+        while the implicit damper acts unclamped. Unclamped substeps reduce to ``q_eff = q*``.
+        """
+        pose, vel = self._joint_arrays(art)
+        active = art.kp > 0
+        excursion = np.where(active, art.effort_limit / np.where(active, art.kp, 1.0), np.inf)
+        q_eff = art.target_pose.copy()
+        err = np.clip(art.target_pose - pose, -excursion, excursion)
+        q_eff[active] = pose[active] + err[active]
+        if art.base_dofs:
+            q_eff[: art.base_dofs] = 0.0
+        art.actor.set_articulated_target_pose(q_eff)
+        if art.target_vel is not None:
+            art.actor.set_articulated_target_velocity(art.target_vel)
+        vel_target = art.target_vel if art.target_vel is not None else 0.0
+        art.last_tau = np.clip(art.kp * err - art.kd * (vel - vel_target), -art.effort_limit, art.effort_limit)
+        if art.effort is not None:
+            idx = np.arange(art.base_dofs, art.num_dofs, dtype=np.int32)
+            art.actor.set_external_forces_on_dofs(dof_indices=idx, force_values=art.effort.astype(np.float32))
 
     # ------------------------------------------------------------------ simulation
     def _simulate(self) -> None:
         for _ in range(self.decimation):
             for art in self._articulations.values():
-                if art.effort is not None:
+                if art.controlled and self._control_mode == "pd":
+                    self._apply_pd_torques(art)
+                elif art.effort is not None:
                     idx = np.arange(art.base_dofs, art.num_dofs, dtype=np.int32)
                     art.actor.set_external_forces_on_dofs(dof_indices=idx, force_values=art.effort.astype(np.float32))
             self._scene.step(self._dt)
@@ -530,7 +621,8 @@ class SuperdexHandler(BaseSimHandler):
                     if idx is None:
                         raise KeyError(f"[superdex] robot '{name}' has no joint '{jn}'")
                     art.target_pose[idx] = float(value)
-                art.actor.set_articulated_target_pose(art.target_pose)
+                if self._control_mode == "implicit":
+                    art.actor.set_articulated_target_pose(art.target_pose)
             vel_targets = payload.get("dof_vel_target")
             if vel_targets:
                 # Best effort, like the MuJoCo backend: the pose controller keeps pulling towards
@@ -541,7 +633,8 @@ class SuperdexHandler(BaseSimHandler):
                     if idx is None:
                         raise KeyError(f"[superdex] robot '{name}' has no joint '{jn}' (dof_vel_target)")
                     vel[idx] = float(value)
-                art.actor.set_articulated_target_velocity(vel)
+                if self._control_mode == "implicit":
+                    art.actor.set_articulated_target_velocity(vel)
                 art.target_vel = vel
             else:
                 art.target_vel = None
@@ -615,7 +708,9 @@ class SuperdexHandler(BaseSimHandler):
                 torch.from_numpy(art.target_vel[idx]).float().unsqueeze(0) if art.target_vel is not None else None
             )
             effort = None
-            if art.controlled:
+            if art.controlled and self._control_mode == "pd" and art.last_tau is not None:
+                effort = torch.from_numpy(art.last_tau[idx]).float().unsqueeze(0)
+            elif art.controlled:
                 try:
                     force = np.asarray(art.actor.get_articulated_controller_force(), dtype=np.float64)
                     if force.shape[0] == art.num_dofs:
@@ -693,7 +788,8 @@ class SuperdexHandler(BaseSimHandler):
         art.actor.set_articulated_joint_velocities(np.zeros(art.num_dofs))
         if art.controlled:
             art.target_pose = pose.copy()
-            art.actor.set_articulated_target_pose(art.target_pose)
+            if self._control_mode == "implicit":
+                art.actor.set_articulated_target_pose(art.target_pose)
 
     # ------------------------------------------------------------------ names
     def _get_joint_names(self, obj_name: str, sort: bool = True) -> list[str]:

@@ -189,10 +189,16 @@ What to expect from the backend (see ``metasim/sim/superdex/superdex.py`` for th
 - **Physics alignment**: Coulomb friction defaults to 1.0 (MuJoCo's geom default; ``static_friction``
   overrides it), URDF joint ranges are enforced with stiff limit penalties, and
   ``enabled_gravity=False`` compensates gravity on every link as the MuJoCo backend does.
-- **Control**: ``RobotCfg.actuators`` stiffness/damping drive SuperDex's implicit pose controller;
-  the effort clamp is ``effort_limit_sim`` if set, else the URDF ``<limit effort>``. Position targets
-  are exact; velocity targets are best effort (they feed the controller's damping term while the
-  position target keeps acting, as on MuJoCo); effort targets are applied as external DoF forces.
+- **Control**: ``RobotCfg.actuators`` stiffness/damping drive SuperDex's implicit pose controller.
+  ``SimParamCfg.superdex_control_mode`` selects how the effort clamp is honoured: ``"pd"`` (default)
+  bounds the target excursion every substep so the spring force never exceeds the limit, which gives
+  the torque-limited slew the MuJoCo backend shows; ``"implicit"`` hands the limit to the native
+  controller's ``saturation`` (in practice not an N m clamp: targets are reached within a few ms).
+  The clamp is ``effort_limit_sim`` if set, else the MJCF actuator ``forcerange`` when the cfg also
+  ships an MJCF (what the MuJoCo backend clamps with), else the URDF ``<limit effort>``. Joint
+  viscous damping / Coulomb friction follow the same URDF-then-MJCF rule (SuperDex's own URDF
+  default of 10 N m s/rad is not used); ``enabled_self_collisions=False`` disables all same-robot
+  contacts, as on MuJoCo. Velocity targets are best effort; effort targets are external DoF forces.
 - **Free bases**: ``fix_base_link=False`` articulations need ``<inertial>`` mass on every link
   (launch fails fast otherwise); ``root_state`` reports the world pose of the root link.
 - **Contact forces** (``metasim.queries.ContactForces``): SuperDex 1.0 only exposes contact queries
