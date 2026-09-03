@@ -137,7 +137,10 @@ def watertight_hull(mesh):
     """Return a closed surface for ``mesh``: the mesh itself if already watertight, else its convex hull."""
     if mesh.is_watertight and mesh.volume > 0:
         return mesh
-    hull = mesh.convex_hull
+    try:
+        hull = mesh.convex_hull
+    except Exception as exc:  # qhull raises its own error class for flat / too-few-point input
+        raise ValueError(f"collision mesh is degenerate: convex hull failed ({exc})") from exc
     if not hull.is_watertight:  # degenerate (flat) input
         raise ValueError("collision mesh is degenerate: its convex hull is not a closed surface")
     return hull
