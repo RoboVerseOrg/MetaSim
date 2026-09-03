@@ -7,7 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Nothing yet — open a PR to add entries here.
+### Changed
+
+- **Distribution renamed to `roboverse-metasim`** (`metasim` on PyPI is an unrelated project); the
+  import name stays `metasim`. Downstream requirements must say `roboverse-metasim @ git+...`.
+  `metasim.__version__` now reads the installed version from package metadata.
+
+### Added
+
+- `RELEASING.md` + `CONTRIBUTING.md`: branching, PR gates, SemVer, release checklist, PyPI
+  trusted publishing, branch-protection settings.
+- CI on every PR without a GPU: `ci.yml` (ruff + `-k general` on 3.10/3.11), `pr-title.yml`
+  (Conventional Commit titles), `changelog.yml` (entry required for library changes),
+  `release.yml` (tag → build, GitHub Release, PyPI), `CODEOWNERS`.
 
 ## [0.2.0] - 2026-05-31
 
