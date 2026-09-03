@@ -564,25 +564,36 @@ class SuperdexHandler(BaseSimHandler):
     def _apply_pd_torques(self, art: _Articulation) -> None:
         """One substep of effort-clamped PD (pd control mode) plus any effort targets.
 
-        The MuJoCo backend applies ``clip(kp (q* - q) - kd qd, +-limit)``. An explicit torque with
-        kd ~ 1e4 is unstable at any usable substep, so the spring/damper stays inside SuperDex's
-        implicit controller and the effort clamp is enforced on the spring term by bounding the
-        target excursion: ``q_eff = q + clip(q* - q, +-limit / kp)`` keeps ``|kp (q_eff - q)| <= limit``
-        while the implicit damper acts unclamped. Unclamped substeps reduce to ``q_eff = q*``.
+        The MuJoCo backend applies ``tau = clip(kp e - kd qd, +-L)`` (``e = q* - q``). Applying that
+        explicitly is unstable here (kd ~ 1e4 at a 1 ms step), so the spring/damper stays inside
+        SuperDex's implicit controller and the clamp is reproduced by shaping what the controller
+        tracks each substep:
+
+        * unsaturated (``|kp e| <= L``): target ``q*``, target velocity 0 — plain PD;
+        * saturated: the spring excursion is bounded to ``L / kp`` so the spring force is ``+-L``, and
+          the damper is referenced to ``v_ref = (kp e - L sign(e)) / kd`` — the steady velocity a
+          clamped PD settles at — so it does not fight the motion the clamp allows.
         """
         pose, vel = self._joint_arrays(art)
         active = art.kp > 0
-        excursion = np.where(active, art.effort_limit / np.where(active, art.kp, 1.0), np.inf)
+        kp = np.where(active, art.kp, 1.0)
+        kd = np.where(art.kd > 0, art.kd, 1.0)
+        err = art.target_pose - pose
+        spring = art.kp * err
+        saturated = active & (np.abs(spring) > art.effort_limit)
+        excursion = np.where(saturated, art.effort_limit / kp, np.inf)
         q_eff = art.target_pose.copy()
-        err = np.clip(art.target_pose - pose, -excursion, excursion)
-        q_eff[active] = pose[active] + err[active]
+        q_eff[active] = pose[active] + np.clip(err, -excursion, excursion)[active]
+        v_ref = np.zeros_like(pose)
+        v_ref[saturated] = ((spring - art.effort_limit * np.sign(err)) / kd)[saturated]
+        if art.target_vel is not None:
+            v_ref = v_ref + art.target_vel
         if art.base_dofs:
             q_eff[: art.base_dofs] = 0.0
+            v_ref[: art.base_dofs] = 0.0
         art.actor.set_articulated_target_pose(q_eff)
-        if art.target_vel is not None:
-            art.actor.set_articulated_target_velocity(art.target_vel)
-        vel_target = art.target_vel if art.target_vel is not None else 0.0
-        art.last_tau = np.clip(art.kp * err - art.kd * (vel - vel_target), -art.effort_limit, art.effort_limit)
+        art.actor.set_articulated_target_velocity(v_ref)
+        art.last_tau = np.clip(spring - art.kd * (vel - v_ref), -art.effort_limit, art.effort_limit)
         if art.effort is not None:
             idx = np.arange(art.base_dofs, art.num_dofs, dtype=np.int32)
             art.actor.set_external_forces_on_dofs(dof_indices=idx, force_values=art.effort.astype(np.float32))
